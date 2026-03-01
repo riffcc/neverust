@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
 
-use crate::blockexc::{BlockExcMode, BlockExcBehaviour };
+use crate::blockexc::BlockExcBehaviour;
 use crate::identify_shim::{IdentifyBehaviour, IdentifyConfig};
 use crate::storage::BlockStore;
 
@@ -66,7 +66,8 @@ impl From<void::Void> for BehaviourEvent {
 /// Returns (swarm, block_request_tx, keypair)
 pub async fn create_swarm(
     block_store: Arc<BlockStore>,
-    mode: BlockExcMode,
+    mode: String,
+    price_per_byte: u64,
     metrics: crate::metrics::Metrics,
 ) -> Result<
     (
@@ -96,7 +97,7 @@ pub async fn create_swarm(
     tracing::info!(
         "Local peer ID: {} (mode: {}, key: secp256k1)",
         peer_id,
-        mode.mode_string()
+        mode
     );
 
     // Create Identify config using our custom shim for nim-libp2p compatibility
@@ -118,7 +119,7 @@ pub async fn create_swarm(
 
     // Create behavior: BlockExc + Identify
     let (blockexc_behaviour, block_request_tx) =
-        BlockExcBehaviour::new(block_store, mode, metrics);
+        BlockExcBehaviour::new(block_store, mode, price_per_byte, metrics);
     let behaviour = Behaviour {
         blockexc: blockexc_behaviour,
         identify: identify_behaviour,
