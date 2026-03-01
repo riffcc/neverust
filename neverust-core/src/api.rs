@@ -1,7 +1,7 @@
 //! REST API for block operations and node management
 
 use axum::{
-    extract::{Path, State},
+    extract::{DefaultBodyLimit, Path, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -198,6 +198,9 @@ pub fn create_router(
             post(debug_testing_not_supported),
         )
         .with_state(state)
+        // Axum applies a 2 MiB default body limit for `Bytes` extractors.
+        // Disable it so upload size is constrained only by host resources.
+        .layer(DefaultBodyLimit::disable())
         .layer(TraceLayer::new_for_http())
 }
 
@@ -1092,5 +1095,39 @@ mod tests {
 
         let response = app.clone().oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_large_archivist_upload_over_2mb() {
+        use crate::botg::BoTgConfig;
+        use libp2p::identity::Keypair;
+
+        let block_store = Arc::new(BlockStore::new());
+        let metrics = Metrics::new();
+        let botg = Arc::new(BoTgProtocol::new(BoTgConfig::default()));
+        let keypair = Arc::new(Keypair::generate_ed25519());
+        let listen_addrs = Arc::new(RwLock::new(vec!["/ip4/127.0.0.1/tcp/8070"
+            .parse()
+            .unwrap()]));
+        let app = create_router(
+            block_store,
+            metrics,
+            "12D3KooWTest123".to_string(),
+            botg,
+            keypair,
+            listen_addrs,
+        );
+
+        // 3 MiB payload exceeds Axum's default 2 MiB limit.
+        let payload = vec![0xAB; 3 * 1024 * 1024];
+        let request = Request::builder()
+            .method("POST")
+            .uri("/api/archivist/v1/data")
+            .header("content-type", "application/octet-stream")
+            .body(Body::from(payload))
+            .unwrap();
+
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 }
