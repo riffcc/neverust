@@ -1,6 +1,7 @@
 //! REST API for block operations and node management
 
 use axum::{
+    body::Body,
     extract::{DefaultBodyLimit, Path, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
@@ -17,12 +18,11 @@ use tracing::{error, info};
 
 use crate::archivist_tree::ArchivistTree;
 use crate::botg::BoTgProtocol;
-use crate::chunker::Chunker;
+use crate::chunker::DEFAULT_BLOCK_SIZE;
 use crate::manifest::Manifest;
 use crate::metrics::Metrics;
 use crate::storage::{Block, BlockStore, StorageError};
 use libp2p::{identity::Keypair, Multiaddr};
-use std::io::Cursor;
 use std::sync::RwLock;
 
 /// Convert CID to base58btc string (Archivist format with 'z' prefix)
@@ -623,53 +623,64 @@ async fn debug_testing_not_supported() -> Result<StatusCode, ApiError> {
 
 /// Archivist-compatible upload endpoint (POST /api/archivist/v1/data)
 /// Returns manifest CID as plain text
-async fn archivist_upload(
-    State(state): State<ApiState>,
-    body: bytes::Bytes,
-) -> Result<String, ApiError> {
-    if body.is_empty() {
-        return Err(ApiError::BadRequest("Empty data".to_string()));
-    }
+async fn archivist_upload(State(state): State<ApiState>, body: Body) -> Result<String, ApiError> {
+    use bytes::BytesMut;
+    use futures::StreamExt;
 
-    let dataset_size = body.len();
-    info!(
-        "Archivist API: Uploading data ({} bytes) - will chunk and create manifest",
-        dataset_size
-    );
+    info!("Archivist API: Streaming upload started");
 
-    // Step 1: Chunk the data and store blocks
-    let cursor = Cursor::new(body.to_vec());
-    let mut chunker = Chunker::new(cursor); // Uses default 64KB chunks
+    // Stream chunks from the request body and store fixed-size blocks immediately.
+    // This keeps memory bounded instead of buffering the full upload in RAM.
+    let mut stream = body.into_data_stream();
+    let mut pending = BytesMut::with_capacity(DEFAULT_BLOCK_SIZE * 2);
+    let mut dataset_size: u64 = 0;
     let mut block_cids = Vec::new();
 
-    while let Some(chunk) = chunker
-        .next_chunk()
-        .await
-        .map_err(|e| ApiError::Internal(format!("Failed to read chunk: {}", e)))?
-    {
-        // Create block from chunk (uses codec 0xcd02)
-        let block = Block::new(chunk)
-            .map_err(|e| ApiError::Internal(format!("Failed to create block: {}", e)))?;
+    while let Some(next) = stream.next().await {
+        let chunk =
+            next.map_err(|e| ApiError::Internal(format!("Failed to read body stream: {}", e)))?;
+        if chunk.is_empty() {
+            continue;
+        }
 
-        info!(
-            "Archivist API: Created block {} ({} bytes)",
-            block.cid,
-            block.size()
-        );
+        dataset_size = dataset_size
+            .checked_add(chunk.len() as u64)
+            .ok_or_else(|| ApiError::BadRequest("Upload too large".to_string()))?;
+        pending.extend_from_slice(&chunk);
 
+        while pending.len() >= DEFAULT_BLOCK_SIZE {
+            let block_bytes = pending.split_to(DEFAULT_BLOCK_SIZE).to_vec();
+            let block = Block::new(block_bytes)
+                .map_err(|e| ApiError::Internal(format!("Failed to create block: {}", e)))?;
+
+            block_cids.push(block.cid);
+            state
+                .block_store
+                .put(block)
+                .await
+                .map_err(|e| ApiError::Internal(format!("Failed to store block: {}", e)))?;
+        }
+    }
+
+    if !pending.is_empty() {
+        let block = Block::new(pending.to_vec())
+            .map_err(|e| ApiError::Internal(format!("Failed to create final block: {}", e)))?;
         block_cids.push(block.cid);
-
-        // Store block
         state
             .block_store
             .put(block)
             .await
-            .map_err(|e| ApiError::Internal(format!("Failed to store block: {}", e)))?;
+            .map_err(|e| ApiError::Internal(format!("Failed to store final block: {}", e)))?;
+    }
+
+    if dataset_size == 0 {
+        return Err(ApiError::BadRequest("Empty data".to_string()));
     }
 
     info!(
-        "Archivist API: Stored {} blocks for dataset",
-        block_cids.len()
+        "Archivist API: Stored {} blocks for dataset ({} bytes)",
+        block_cids.len(),
+        dataset_size
     );
 
     // Step 2: Build Archivist tree from block CIDs
@@ -711,8 +722,8 @@ async fn archivist_upload(
     // Format: "metadata:<cid>"
     let manifest = Manifest::new(
         tree_cid,
-        chunker.chunk_size() as u64,
-        dataset_size as u64,
+        DEFAULT_BLOCK_SIZE as u64,
+        dataset_size,
         None,                                            // codec (uses default 0xcd02)
         None,                                            // hcodec (uses default SHA-256)
         None,                                            // version (uses default 1)
