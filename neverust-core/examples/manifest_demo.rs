@@ -33,8 +33,8 @@ fn main() {
     println!("1. Creating a simple unprotected manifest...");
     let manifest = Manifest::new(
         tree_cid,
-        65536,            // 64KB block size
-        10 * 1024 * 1024, // 10MB dataset
+        65536,              // 64KB block size
+        10 * 1024 * 1024,   // 10MB dataset
         Some(BLOCK_CODEC),
         Some(SHA256_CODEC),
         Some(1),
@@ -57,52 +57,30 @@ fn main() {
     println!("2. Encoding manifest to protobuf...");
     let encoded = manifest.encode().expect("Encode failed");
     println!("   Encoded size: {} bytes", encoded.len());
-    println!(
-        "   First 32 bytes (hex): {}",
-        hex::encode(&encoded[..32.min(encoded.len())])
-    );
+    println!("   First 32 bytes (hex): {}", hex::encode(&encoded[..32.min(encoded.len())]));
     println!();
 
     // Decode from protobuf
     println!("3. Decoding manifest from protobuf...");
     let decoded = Manifest::decode(&encoded).expect("Decode failed");
-    println!(
-        "   Tree CID matches: {}",
-        decoded.tree_cid == manifest.tree_cid
-    );
-    println!(
-        "   Block size matches: {}",
-        decoded.block_size == manifest.block_size
-    );
-    println!(
-        "   Dataset size matches: {}",
-        decoded.dataset_size == manifest.dataset_size
-    );
-    println!(
-        "   Filename matches: {}",
-        decoded.filename == manifest.filename
-    );
+    println!("   Tree CID matches: {}", decoded.tree_cid == manifest.tree_cid);
+    println!("   Block size matches: {}", decoded.block_size == manifest.block_size);
+    println!("   Dataset size matches: {}", decoded.dataset_size == manifest.dataset_size);
+    println!("   Filename matches: {}", decoded.filename == manifest.filename);
     println!();
 
     // Create a block from the manifest
     println!("4. Creating a block from the manifest...");
     let block = manifest.to_block().expect("to_block failed");
     println!("   Block CID: {}", block.cid);
-    println!(
-        "   Block codec: 0x{:x} (should be 0x{:x})",
-        block.cid.codec(),
-        MANIFEST_CODEC
-    );
+    println!("   Block codec: 0x{:x} (should be 0x{:x})", block.cid.codec(), MANIFEST_CODEC);
     println!("   Block data size: {} bytes", block.data.len());
     println!();
 
     // Recover manifest from block
     println!("5. Recovering manifest from block...");
     let recovered = Manifest::from_block(&block).expect("from_block failed");
-    println!(
-        "   Tree CID matches: {}",
-        recovered.tree_cid == manifest.tree_cid
-    );
+    println!("   Tree CID matches: {}", recovered.tree_cid == manifest.tree_cid);
     println!("   All fields match: {}", recovered == manifest);
     println!();
 
