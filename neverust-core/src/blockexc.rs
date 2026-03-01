@@ -11,13 +11,10 @@ use libp2p::swarm::{
     ConnectionHandler, ConnectionHandlerEvent, StreamProtocol, SubstreamProtocol,
 };
 use libp2p::PeerId;
-use serde::Deserialize;
-use serde::Serialize;
 use std::io;
 use std::sync::Arc;
 use tracing::{info, warn};
 
-use crate::discovery::Discovery;
 use crate::metrics::Metrics;
 use crate::storage::BlockStore;
 
@@ -82,41 +79,6 @@ async fn write_length_prefixed<W: AsyncWriteExt + Unpin>(
     Ok(())
 }
 
-#[derive(Default, Clone, Debug, Serialize, Deserialize)]
-pub enum BlockExcMode {
-    #[default]
-    Altruistic,
-    MarketPlace{ price_per_byte: u64 },
-}
-impl std::str::FromStr for BlockExcMode {
-    type Err = &'static str;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "altruistic" => Ok(Self::Altruistic),
-            "marketplace" => Ok(Self::MarketPlace { price_per_byte: 1 }),
-            _ => Err("unrecognised mode (options: 'altruistic', 'marketplace')")
-        }
-    }
-}
-
-
-impl BlockExcMode {
-    pub fn mode_string(&self) -> String {
-        match self {
-            Self::Altruistic => "altruistic".to_string(),
-            Self::MarketPlace { price_per_byte } => format!("Market @ {} per byte", price_per_byte)
-        }
-    }
-    fn price_per_byte(&self) -> Option<u64> {
-        if let Self::MarketPlace { price_per_byte } = self {
-            Some(*price_per_byte)
-        } else {
-            None
-        }
-    }
-
-}
 /// BlockExc connection handler
 pub struct BlockExcHandler {
     peer_id: PeerId,
@@ -127,7 +89,9 @@ pub struct BlockExcHandler {
     /// Shared block store for reading/writing blocks
     block_store: Arc<BlockStore>,
     /// Node operating mode (altruistic or marketplace)
-    mode: BlockExcMode,
+    mode: String,
+    /// Price per byte in marketplace mode
+    price_per_byte: u64,
     /// Metrics collector for tracking P2P traffic
     metrics: Metrics,
     /// Pending block request (if any)
@@ -138,7 +102,8 @@ impl BlockExcHandler {
     pub fn new(
         peer_id: PeerId,
         block_store: Arc<BlockStore>,
-        mode: BlockExcMode,
+        mode: String,
+        price_per_byte: u64,
         metrics: Metrics,
     ) -> Self {
         BlockExcHandler {
@@ -147,6 +112,7 @@ impl BlockExcHandler {
             has_active_stream: false,
             block_store,
             mode,
+            price_per_byte,
             metrics,
             pending_request: None,
         }
@@ -243,8 +209,9 @@ impl ConnectionHandler for BlockExcHandler {
                 let peer_id = self.peer_id;
                 let block_store = self.block_store.clone();
                 let mode = self.mode.clone();
+                let price_per_byte = self.price_per_byte;
                 let metrics = self.metrics.clone();
-                info!("BlockExc: Fully negotiated inbound stream from {} (mode: {})", peer_id, mode.mode_string());
+                info!("BlockExc: Fully negotiated inbound stream from {} (mode: {}, price: {} per byte)", peer_id, mode, price_per_byte);
 
                 // Spawn task to handle the stream - read messages from remote peer
                 tokio::spawn(async move {
@@ -272,11 +239,7 @@ impl ConnectionHandler for BlockExcHandler {
 
                                         // DEBUG: Log wantlist details
                                         if let Some(ref wl) = msg.wantlist {
-                                            info!(
-                                                "BlockExc: Wantlist has {} entries, full={}",
-                                                wl.entries.len(),
-                                                wl.full
-                                            );
+                                            info!("BlockExc: Wantlist has {} entries, full={}", wl.entries.len(), wl.full);
                                             for (i, entry) in wl.entries.iter().enumerate() {
                                                 info!("BlockExc:   Entry[{}]: address={}, priority={}, cancel={}, want_type={}, send_dont_have={}",
                                                     i,
@@ -302,7 +265,7 @@ impl ConnectionHandler for BlockExcHandler {
                                         if let Some(wantlist) = msg.wantlist {
                                             use crate::messages::BlockPresence;
 
-                                            if let BlockExcMode::Altruistic = mode {
+                                            if mode == "altruistic" {
                                                 // ALTRUISTIC MODE: Serve blocks freely without payment
                                                 info!("BlockExc: ALTRUISTIC MODE - serving blocks freely to {}", peer_id);
                                                 let mut response_blocks = Vec::new();
@@ -364,7 +327,7 @@ impl ConnectionHandler for BlockExcHandler {
                                                         break;
                                                     }
                                                 }
-                                            } else if let BlockExcMode::MarketPlace { price_per_byte: _ } = mode {
+                                            } else if mode == "marketplace" {
                                                 // MARKETPLACE MODE: Check payment before serving
                                                 info!("BlockExc: MARKETPLACE MODE - checking payment from {}", peer_id);
 
@@ -443,7 +406,7 @@ impl ConnectionHandler for BlockExcHandler {
                                                                 {
                                                                     let block_price =
                                                                         (block.data.len() as u64)
-                                                                            * mode.price_per_byte().unwrap_or_default();
+                                                                            * price_per_byte;
                                                                     info!("BlockExc: Block {} available for {} units", cid, block_price);
 
                                                                     block_presences.push(
@@ -481,7 +444,9 @@ impl ConnectionHandler for BlockExcHandler {
                                                         }
                                                     }
                                                 }
-                                            } 
+                                            } else {
+                                                warn!("BlockExc: Unknown mode '{}', defaulting to altruistic", mode);
+                                            }
                                         }
                                     }
                                     Err(e) => {
@@ -686,7 +651,8 @@ pub struct BlockRequest {
 /// BlockExc network behaviour
 pub struct BlockExcBehaviour {
     block_store: Arc<BlockStore>,
-    mode: BlockExcMode,
+    mode: String,
+    price_per_byte: u64,
     metrics: Metrics,
     /// Channel for receiving block requests
     request_rx: mpsc::UnboundedReceiver<BlockRequest>,
@@ -696,40 +662,27 @@ pub struct BlockExcBehaviour {
     connected_peers: std::collections::HashSet<PeerId>,
     /// Pending events to send to handlers
     pending_events: std::collections::VecDeque<(PeerId, BlockExcFromBehaviour)>,
-    /// Discovery engine for finding providers (optional)
-    discovery: Option<Arc<Discovery>>,
-    /// Blocks queued for discovery (CID -> retry count)
-    discovery_queue: std::collections::HashMap<cid::Cid, u32>,
 }
 
 impl BlockExcBehaviour {
     pub fn new(
         block_store: Arc<BlockStore>,
-        mode: BlockExcMode,
+        mode: String,
+        price_per_byte: u64,
         metrics: Metrics,
     ) -> (Self, mpsc::UnboundedSender<BlockRequest>) {
         let (request_tx, request_rx) = mpsc::unbounded_channel();
         let behaviour = Self {
             block_store,
             mode,
+            price_per_byte,
             metrics,
             request_rx,
             pending_requests: std::collections::HashMap::new(),
             connected_peers: std::collections::HashSet::new(),
             pending_events: std::collections::VecDeque::new(),
-            discovery: None,
-            discovery_queue: std::collections::HashMap::new(),
         };
         (behaviour, request_tx)
-    }
-
-    /// Set the discovery engine for automatic provider discovery
-    ///
-    /// When a block is not found from connected peers, the discovery engine
-    /// will be used to find providers for the block.
-    pub fn set_discovery(&mut self, discovery: Arc<Discovery>) {
-        info!("BlockExc: Discovery engine enabled");
-        self.discovery = Some(discovery);
     }
 
     /// Request a specific block from a specific peer
@@ -800,140 +753,6 @@ impl BlockExcBehaviour {
     /// Get a list of all connected peer IDs
     pub fn connected_peers(&self) -> Vec<PeerId> {
         self.connected_peers.iter().copied().collect()
-    }
-
-    /// Queue blocks for discovery when not found via BlockExc
-    ///
-    /// This is called when a block request fails because no connected peers have it.
-    /// The discovery engine will search the DHT for providers.
-    ///
-    /// # Arguments
-    /// * `cids` - List of CIDs to discover providers for
-    ///
-    /// # Returns
-    /// Number of blocks queued for discovery (0 if discovery disabled)
-    pub fn queue_find_blocks(&mut self, cids: Vec<Cid>) -> usize {
-        if self.discovery.is_none() {
-            warn!("BlockExc: Discovery disabled, cannot queue blocks for discovery");
-            return 0;
-        }
-
-        let mut queued = 0;
-        for cid in cids {
-            // Don't re-queue if already in discovery
-            use std::collections::hash_map::Entry;
-            if let Entry::Vacant(e) = self.discovery_queue.entry(cid) {
-                info!("BlockExc: Queueing block {} for discovery", cid);
-                e.insert(0); // 0 retries initially
-                queued += 1;
-            }
-        }
-
-        queued
-    }
-
-    /// Process discovery queue - find providers for queued blocks
-    ///
-    /// This should be called periodically from the poll() method to process
-    /// blocks waiting for provider discovery.
-    async fn _process_discovery_queue(&mut self) {
-        if self.discovery.is_none() {
-            return;
-        }
-
-        let discovery = self.discovery.as_ref().unwrap().clone();
-        let mut completed = Vec::new();
-
-        // Process each queued CID
-        for (cid, retry_count) in &mut self.discovery_queue {
-            const MAX_RETRIES: u32 = 3;
-
-            if *retry_count >= MAX_RETRIES {
-                warn!(
-                    "BlockExc: Discovery for block {} exceeded max retries ({})",
-                    cid, MAX_RETRIES
-                );
-                completed.push(*cid);
-                continue;
-            }
-
-            info!(
-                "BlockExc: Searching for providers of block {} (attempt {}/{})",
-                cid,
-                *retry_count + 1,
-                MAX_RETRIES
-            );
-
-            // Track discovery query
-            self.metrics.discovery_query();
-
-            // Find providers via discovery engine
-            match discovery.find(cid).await {
-                Ok(providers) if !providers.is_empty() => {
-                    info!(
-                        "BlockExc: Found {} providers for block {} via discovery",
-                        providers.len(),
-                        cid
-                    );
-
-                    // Track successful discovery
-                    self.metrics.discovery_success();
-
-                    // Request block from discovered providers
-                    for provider in providers {
-                        if self.connected_peers.contains(&provider) {
-                            // Already connected, request directly
-                            self.pending_events.push_back((
-                                provider,
-                                BlockExcFromBehaviour::RequestBlock { cid: *cid },
-                            ));
-                        } else {
-                            // TODO: Dial the provider first, then request
-                            info!(
-                                "BlockExc: Need to dial provider {} for block {}",
-                                provider, cid
-                            );
-                        }
-                    }
-
-                    // Mark as completed (found providers)
-                    completed.push(*cid);
-                }
-                Ok(_) => {
-                    // No providers found yet, increment retry count
-                    *retry_count += 1;
-                    info!(
-                        "BlockExc: No providers found for block {} (retry {}/{})",
-                        cid, *retry_count, MAX_RETRIES
-                    );
-
-                    // Track failure if max retries reached
-                    if *retry_count >= MAX_RETRIES {
-                        self.metrics.discovery_failure();
-                    }
-                }
-                Err(e) => {
-                    warn!(
-                        "BlockExc: Discovery error for block {}: {} (retry {}/{})",
-                        cid,
-                        e,
-                        *retry_count + 1,
-                        MAX_RETRIES
-                    );
-                    *retry_count += 1;
-
-                    // Track failure if max retries reached
-                    if *retry_count >= MAX_RETRIES {
-                        self.metrics.discovery_failure();
-                    }
-                }
-            }
-        }
-
-        // Remove completed CIDs from queue
-        for cid in completed {
-            self.discovery_queue.remove(&cid);
-        }
     }
 }
 
@@ -1046,6 +865,7 @@ impl libp2p::swarm::NetworkBehaviour for BlockExcBehaviour {
             peer,
             self.block_store.clone(),
             self.mode.clone(),
+            self.price_per_byte,
             self.metrics.clone(),
         ))
     }
@@ -1062,6 +882,7 @@ impl libp2p::swarm::NetworkBehaviour for BlockExcBehaviour {
             peer,
             self.block_store.clone(),
             self.mode.clone(),
+            self.price_per_byte,
             self.metrics.clone(),
         ))
     }
@@ -1096,18 +917,6 @@ impl libp2p::swarm::NetworkBehaviour for BlockExcBehaviour {
                     peer_id,
                     data.len()
                 );
-
-                // Check if this block was retrieved via discovery
-                let from_discovery = self.discovery_queue.contains_key(&cid);
-                if from_discovery {
-                    info!(
-                        "BlockExc behaviour: Block {} was retrieved via discovery!",
-                        cid
-                    );
-                    self.metrics.block_from_discovery();
-                    // Remove from discovery queue since we got it
-                    self.discovery_queue.remove(&cid);
-                }
 
                 // Store in block store
                 let block = crate::storage::Block { cid, data };

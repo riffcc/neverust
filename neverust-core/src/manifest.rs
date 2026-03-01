@@ -48,18 +48,18 @@ pub type Result<T> = std::result::Result<T, ManifestError>;
 /// Indexing strategy type
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StrategyType {
-    /// Linear strategy: slot 0 => blocks [0,1,2], slot 1 => blocks [3,4,5], ...
-    LinearStrategy = 0,
     /// Stepped strategy: slot 0 => blocks [0,3,6], slot 1 => blocks [1,4,7], ...
-    SteppedStrategy = 1,
+    SteppedStrategy = 0,
+    /// Linear strategy: slot 0 => blocks [0,1,2], slot 1 => blocks [3,4,5], ...
+    LinearStrategy = 1,
 }
 
 impl From<u32> for StrategyType {
     fn from(value: u32) -> Self {
         match value {
-            0 => StrategyType::LinearStrategy,
-            1 => StrategyType::SteppedStrategy,
-            _ => StrategyType::LinearStrategy, // Default to 0
+            0 => StrategyType::SteppedStrategy,
+            1 => StrategyType::LinearStrategy,
+            _ => StrategyType::SteppedStrategy, // Default to 0
         }
     }
 }
@@ -122,7 +122,6 @@ pub struct Manifest {
 
 impl Manifest {
     /// Create a new unprotected manifest
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         tree_cid: Cid,
         block_size: u64,
@@ -147,7 +146,6 @@ impl Manifest {
     }
 
     /// Create a protected manifest with erasure coding
-    #[allow(clippy::too_many_arguments)]
     pub fn new_protected(
         tree_cid: Cid,
         block_size: u64,
@@ -198,7 +196,7 @@ impl Manifest {
 
     /// Get number of blocks in the dataset
     pub fn blocks_count(&self) -> usize {
-        self.dataset_size.div_ceil(self.block_size) as usize
+        ((self.dataset_size + self.block_size - 1) / self.block_size) as usize
     }
 
     /// Encode the manifest to protobuf bytes
@@ -218,43 +216,47 @@ impl Manifest {
     /// }
     /// ```
     pub fn encode(&self) -> Result<Vec<u8>> {
-        let mut header = proto::Header {
-            tree_cid: self.tree_cid.to_bytes(),
-            block_size: self.block_size as u32,
-            dataset_size: self.dataset_size,
-            codec: self.codec as u32,
-            hcodec: self.hcodec as u32,
-            version: self.version,
-            filename: self.filename.clone().unwrap_or_default(),
-            mimetype: self.mimetype.clone().unwrap_or_default(),
-            ..Default::default()
-        };
+        let mut header = proto::Header::default();
+
+        // Encode tree CID as raw bytes
+        header.tree_cid = self.tree_cid.to_bytes();
+        header.block_size = self.block_size as u32;
+        header.dataset_size = self.dataset_size;
+        header.codec = self.codec as u32;
+        header.hcodec = self.hcodec as u32;
+        header.version = self.version;
+
+        // Encode filename and mimetype if present
+        if let Some(ref filename) = self.filename {
+            header.filename = filename.clone();
+        }
+        if let Some(ref mimetype) = self.mimetype {
+            header.mimetype = mimetype.clone();
+        }
 
         // Encode erasure info if protected
         if let Some(ref erasure) = self.erasure {
-            let verification =
-                erasure
-                    .verification
-                    .as_ref()
-                    .map(|verification| proto::VerificationInfo {
-                        verify_root: verification.verify_root.to_bytes(),
-                        slot_roots: verification
-                            .slot_roots
-                            .iter()
-                            .map(|cid| cid.to_bytes())
-                            .collect(),
-                        cell_size: verification.cell_size as u32,
-                        verifiable_strategy: verification.verifiable_strategy as u32,
-                    });
+            let mut erasure_info = proto::ErasureInfo::default();
+            erasure_info.ec_k = erasure.ec_k;
+            erasure_info.ec_m = erasure.ec_m;
+            erasure_info.original_tree_cid = erasure.original_tree_cid.to_bytes();
+            erasure_info.original_dataset_size = erasure.original_dataset_size;
+            erasure_info.protected_strategy = erasure.protected_strategy as u32;
 
-            let erasure_info = proto::ErasureInfo {
-                ec_k: erasure.ec_k,
-                ec_m: erasure.ec_m,
-                original_tree_cid: erasure.original_tree_cid.to_bytes(),
-                original_dataset_size: erasure.original_dataset_size,
-                protected_strategy: erasure.protected_strategy as u32,
-                verification,
-            };
+            // Encode verification info if verifiable
+            if let Some(ref verification) = erasure.verification {
+                let mut verification_info = proto::VerificationInfo::default();
+                verification_info.verify_root = verification.verify_root.to_bytes();
+                verification_info.slot_roots = verification
+                    .slot_roots
+                    .iter()
+                    .map(|cid| cid.to_bytes())
+                    .collect();
+                verification_info.cell_size = verification.cell_size as u32;
+                verification_info.verifiable_strategy = verification.verifiable_strategy as u32;
+
+                erasure_info.verification = Some(verification_info);
+            }
 
             header.erasure = Some(erasure_info);
         }
@@ -264,7 +266,8 @@ impl Manifest {
         header.encode(&mut buf)?;
 
         // Wrap in dag-pb format (field 1 = Data)
-        let pb_node = proto::DagPbNode { data: buf };
+        let mut pb_node = proto::DagPbNode::default();
+        pb_node.data = buf;
 
         let mut result = Vec::new();
         pb_node.encode(&mut result)?;
@@ -286,9 +289,8 @@ impl Manifest {
 
         // Parse erasure info if present
         let erasure = if let Some(erasure_info) = header.erasure {
-            let original_tree_cid = Cid::try_from(erasure_info.original_tree_cid).map_err(|e| {
-                ManifestError::CidError(format!("Invalid original tree CID: {}", e))
-            })?;
+            let original_tree_cid = Cid::try_from(erasure_info.original_tree_cid)
+                .map_err(|e| ManifestError::CidError(format!("Invalid original tree CID: {}", e)))?;
 
             // Parse verification info if present
             let verification = if let Some(verification_info) = erasure_info.verification {
@@ -300,9 +302,8 @@ impl Manifest {
                     .slot_roots
                     .iter()
                     .map(|bytes| {
-                        Cid::try_from(bytes.as_slice()).map_err(|e| {
-                            ManifestError::CidError(format!("Invalid slot root: {}", e))
-                        })
+                        Cid::try_from(bytes.as_slice())
+                            .map_err(|e| ManifestError::CidError(format!("Invalid slot root: {}", e)))
                     })
                     .collect();
 
@@ -582,16 +583,7 @@ mod tests {
     fn test_manifest_encode_decode_minimal() {
         let tree_cid = create_test_cid(b"minimal tree");
 
-        let manifest = Manifest::new(
-            tree_cid,
-            DEFAULT_BLOCK_SIZE,
-            512,
-            None,
-            None,
-            None,
-            None,
-            None,
-        );
+        let manifest = Manifest::new(tree_cid, DEFAULT_BLOCK_SIZE, 512, None, None, None, None, None);
 
         let encoded = manifest.encode().expect("Encode should succeed");
         let decoded = Manifest::decode(&encoded).expect("Decode should succeed");
@@ -633,16 +625,7 @@ mod tests {
     fn test_manifest_cid_computation() {
         let tree_cid = create_test_cid(b"test tree");
 
-        let manifest = Manifest::new(
-            tree_cid,
-            DEFAULT_BLOCK_SIZE,
-            1024,
-            None,
-            None,
-            None,
-            None,
-            None,
-        );
+        let manifest = Manifest::new(tree_cid, DEFAULT_BLOCK_SIZE, 1024, None, None, None, None, None);
 
         let block1 = manifest.to_block().expect("to_block should succeed");
         let block2 = manifest.to_block().expect("to_block should succeed");
@@ -651,16 +634,7 @@ mod tests {
         assert_eq!(block1.cid, block2.cid);
 
         // Different manifest should produce different CID
-        let manifest2 = Manifest::new(
-            tree_cid,
-            DEFAULT_BLOCK_SIZE,
-            2048,
-            None,
-            None,
-            None,
-            None,
-            None,
-        );
+        let manifest2 = Manifest::new(tree_cid, DEFAULT_BLOCK_SIZE, 2048, None, None, None, None, None);
         let block3 = manifest2.to_block().expect("to_block should succeed");
         assert_ne!(block1.cid, block3.cid);
     }
@@ -817,10 +791,7 @@ mod tests {
         assert_eq!(verification.slot_roots[1], slot_root_2);
         assert_eq!(verification.slot_roots[2], slot_root_3);
         assert_eq!(verification.cell_size, 2048);
-        assert_eq!(
-            verification.verifiable_strategy,
-            StrategyType::LinearStrategy
-        );
+        assert_eq!(verification.verifiable_strategy, StrategyType::LinearStrategy);
     }
 
     #[test]
@@ -845,8 +816,8 @@ mod tests {
 
     #[test]
     fn test_strategy_type_conversion() {
-        assert_eq!(StrategyType::from(0), StrategyType::LinearStrategy);
-        assert_eq!(StrategyType::from(1), StrategyType::SteppedStrategy);
-        assert_eq!(StrategyType::from(99), StrategyType::LinearStrategy); // Default
+        assert_eq!(StrategyType::from(0), StrategyType::SteppedStrategy);
+        assert_eq!(StrategyType::from(1), StrategyType::LinearStrategy);
+        assert_eq!(StrategyType::from(99), StrategyType::SteppedStrategy); // Default
     }
 }

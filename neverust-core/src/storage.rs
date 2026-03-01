@@ -1,16 +1,17 @@
-//! RocksDB-backed persistent block storage
+//! redb-backed persistent block storage.
 //!
-//! Provides CID-indexed block storage with BLAKE3 verification,
-//! persistent storage via RocksDB, and optimized configuration
-//! for content-addressed blocks (1KB - 10MB+).
+//! Provides CID-indexed block storage with BLAKE3 verification and
+//! persistence via a single embedded redb database file.
 
 use cid::Cid;
-use rocksdb::{Options, WriteBatch, DB};
-use std::path::Path;
+use redb::{Database, ReadableTable, TableDefinition};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::cid_blake3::{blake3_cid, verify_blake3, CidError};
+
+const BLOCKS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("blocks");
 
 #[derive(Debug, thiserror::Error)]
 pub enum StorageError {
@@ -24,7 +25,7 @@ pub enum StorageError {
     BlockExists(String),
 
     #[error("Database error: {0}")]
-    DatabaseError(#[from] rocksdb::Error),
+    DatabaseError(String),
 
     #[error("IO error: {0}")]
     IoError(#[from] std::io::Error),
@@ -56,83 +57,70 @@ impl Block {
     }
 }
 
-/// RocksDB-backed persistent block storage with CID-based indexing
+/// redb-backed persistent block storage with CID-based indexing.
 pub struct BlockStore {
-    /// RocksDB database handle
-    db: Arc<DB>,
-    /// Callback invoked when a new block is stored (for announcing to network)
-    on_block_stored: Option<Arc<dyn Fn(Cid) + Send + Sync>>,
+    db: Arc<Database>,
+    db_path: PathBuf,
 }
 
 impl BlockStore {
-    /// Create a new block store with in-memory backend (for testing)
+    /// Create a new block store with a temp-file backend (for testing).
     pub fn new() -> Self {
-        // Use a temporary directory for in-memory testing
         let temp_dir =
             std::env::temp_dir().join(format!("neverust-test-{}", rand::random::<u64>()));
         Self::new_with_path(&temp_dir).expect("Failed to create test BlockStore")
     }
 
-    /// Register a callback to be invoked when a new block is stored
+    /// Create a new block store with persistent redb backend.
     ///
-    /// This callback is called asynchronously after successful storage,
-    /// and can be used to announce new blocks to the network.
-    ///
-    /// # Arguments
-    /// * `callback` - Function to call with the CID of each newly stored block
-    ///
-    /// # Example
-    /// ```
-    /// # use neverust_core::storage::BlockStore;
-    /// # use std::sync::Arc;
-    /// let mut store = BlockStore::new();
-    /// store.set_on_block_stored(Arc::new(|cid| {
-    ///     println!("New block stored: {}", cid);
-    /// }));
-    /// ```
-    pub fn set_on_block_stored(&mut self, callback: Arc<dyn Fn(Cid) + Send + Sync>) {
-        self.on_block_stored = Some(callback);
-    }
-
-    /// Create a new block store with persistent RocksDB backend
+    /// If `path` is a directory (or has no extension), the database file is
+    /// created at `<path>/store.redb`.
     pub fn new_with_path<P: AsRef<Path>>(path: P) -> Result<Self, StorageError> {
-        let mut opts = Options::default();
-        opts.create_if_missing(true);
+        let db_path = Self::resolve_db_path(path.as_ref());
+        if let Some(parent) = db_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
 
-        // Optimize for point lookups (CID -> block)
-        opts.optimize_for_point_lookup(256); // 256MB block cache
+        let db = if db_path.exists() {
+            Database::open(&db_path).map_err(Self::db_err)?
+        } else {
+            Database::create(&db_path).map_err(Self::db_err)?
+        };
 
-        // Enable pipelined writes for better throughput
-        opts.set_enable_pipelined_write(true);
+        // Ensure the table exists.
+        {
+            let write_txn = db.begin_write().map_err(Self::db_err)?;
+            write_txn.open_table(BLOCKS_TABLE).map_err(Self::db_err)?;
+            write_txn.commit().map_err(Self::db_err)?;
+        }
 
-        // Compression - disable for already-compressed content blocks
-        opts.set_compression_type(rocksdb::DBCompressionType::None);
-
-        // Performance tuning
-        opts.increase_parallelism(num_cpus::get() as i32);
-        opts.set_max_background_jobs(4);
-
-        // Write buffer and compaction
-        opts.set_write_buffer_size(64 * 1024 * 1024); // 64MB write buffer
-        opts.set_target_file_size_base(128 * 1024 * 1024); // 128MB SST files
-
-        let db = DB::open(&opts, path.as_ref())?;
-
-        info!("Opened RocksDB block store at {:?}", path.as_ref());
+        info!("Opened redb block store at {:?}", db_path);
         Ok(Self {
             db: Arc::new(db),
-            on_block_stored: None,
+            db_path,
         })
     }
 
-    /// Store a block, verifying its CID
+    fn resolve_db_path(path: &Path) -> PathBuf {
+        if (path.exists() && path.is_dir()) || path.extension().is_none() {
+            path.join("store.redb")
+        } else {
+            path.to_path_buf()
+        }
+    }
+
+    fn db_err<E: std::fmt::Display>(err: E) -> StorageError {
+        StorageError::DatabaseError(err.to_string())
+    }
+
+    /// Store a block, verifying its CID.
     pub async fn put(&self, block: Block) -> Result<(), StorageError> {
         let cid_str = block.cid.to_string();
 
         // Verify block integrity (codec-aware)
         // - Data blocks (0xcd02): verify with blake3_cid
-        // - Manifests (0xcd01): skip verification (already verified by Manifest::to_block)
-        // - Tree roots (0xcd03): skip verification (already verified by ArchivistTree)
+        // - Manifests (0xcd01): skip verification
+        // - Tree roots (0xcd03): skip verification
         if block.cid.codec() == 0xcd02 {
             verify_blake3(&block.data, &block.cid)?;
         }
@@ -141,37 +129,29 @@ impl BlockStore {
         let key = cid_str.clone();
         let value = block.data.clone();
 
-        let was_new_block = tokio::task::spawn_blocking(move || {
-            // Check if block already exists (idempotent)
-            if db.get(&key)?.is_some() {
-                debug!("Block already exists: {}", key);
-                return Ok::<bool, StorageError>(false);
+        tokio::task::spawn_blocking(move || {
+            let write_txn = db.begin_write().map_err(Self::db_err)?;
+            {
+                let mut table = write_txn.open_table(BLOCKS_TABLE).map_err(Self::db_err)?;
+                if table.get(key.as_str()).map_err(Self::db_err)?.is_some() {
+                    debug!("Block already exists: {}", key);
+                    return Ok::<(), StorageError>(());
+                }
+                table
+                    .insert(key.as_str(), value.as_slice())
+                    .map_err(Self::db_err)?;
             }
-
-            // Store block
-            db.put(&key, &value)?;
-            Ok(true)
+            write_txn.commit().map_err(Self::db_err)?;
+            Ok(())
         })
         .await
         .map_err(|e| StorageError::IoError(std::io::Error::other(e.to_string())))??;
 
-        if was_new_block {
-            info!("Stored block {}, size: {} bytes", cid_str, block.data.len());
-
-            // Invoke callback asynchronously if registered
-            if let Some(callback) = &self.on_block_stored {
-                let callback = Arc::clone(callback);
-                let cid = block.cid;
-                tokio::spawn(async move {
-                    callback(cid);
-                });
-            }
-        }
-
+        info!("Stored block {}, size: {} bytes", cid_str, block.data.len());
         Ok(())
     }
 
-    /// Store raw data, computing and verifying CID
+    /// Store raw data, computing and verifying CID.
     pub async fn put_data(&self, data: Vec<u8>) -> Result<Cid, StorageError> {
         let block = Block::new(data)?;
         let cid = block.cid;
@@ -179,17 +159,24 @@ impl BlockStore {
         Ok(cid)
     }
 
-    /// Retrieve a block by CID
+    /// Retrieve a block by CID.
     pub async fn get(&self, cid: &Cid) -> Result<Block, StorageError> {
         let cid_str = cid.to_string();
         let db = Arc::clone(&self.db);
         let key = cid_str.clone();
         let cid_copy = *cid;
 
-        let data = tokio::task::spawn_blocking(move || db.get(&key))
-            .await
-            .map_err(|e| StorageError::IoError(std::io::Error::other(e.to_string())))??
-            .ok_or(StorageError::BlockNotFound(cid_str))?;
+        let data = tokio::task::spawn_blocking(move || {
+            let read_txn = db.begin_read().map_err(Self::db_err)?;
+            let table = read_txn.open_table(BLOCKS_TABLE).map_err(Self::db_err)?;
+            table
+                .get(key.as_str())
+                .map_err(Self::db_err)?
+                .map(|v| v.value().to_vec())
+                .ok_or(StorageError::BlockNotFound(key))
+        })
+        .await
+        .map_err(|e| StorageError::IoError(std::io::Error::other(e.to_string())))??;
 
         Ok(Block {
             cid: cid_copy,
@@ -197,31 +184,37 @@ impl BlockStore {
         })
     }
 
-    /// Check if a block exists
+    /// Check if a block exists.
     pub async fn has(&self, cid: &Cid) -> bool {
         let cid_str = cid.to_string();
         let db = Arc::clone(&self.db);
 
         tokio::task::spawn_blocking(move || {
-            db.get(&cid_str).map(|opt| opt.is_some()).unwrap_or(false)
+            let read_txn = db.begin_read().map_err(Self::db_err)?;
+            let table = read_txn.open_table(BLOCKS_TABLE).map_err(Self::db_err)?;
+            Ok::<bool, StorageError>(table.get(cid_str.as_str()).map_err(Self::db_err)?.is_some())
         })
         .await
+        .ok()
+        .and_then(Result::ok)
         .unwrap_or(false)
     }
 
-    /// Delete a block
+    /// Delete a block.
     pub async fn delete(&self, cid: &Cid) -> Result<(), StorageError> {
         let cid_str = cid.to_string();
         let db = Arc::clone(&self.db);
         let key = cid_str.clone();
 
         tokio::task::spawn_blocking(move || {
-            // Check if block exists
-            if db.get(&key)?.is_none() {
-                return Err(StorageError::BlockNotFound(key.clone()));
+            let write_txn = db.begin_write().map_err(Self::db_err)?;
+            {
+                let mut table = write_txn.open_table(BLOCKS_TABLE).map_err(Self::db_err)?;
+                if table.remove(key.as_str()).map_err(Self::db_err)?.is_none() {
+                    return Err(StorageError::BlockNotFound(key));
+                }
             }
-
-            db.delete(&key)?;
+            write_txn.commit().map_err(Self::db_err)?;
             Ok::<(), StorageError>(())
         })
         .await
@@ -231,72 +224,96 @@ impl BlockStore {
         Ok(())
     }
 
-    /// Get all CIDs in the store
+    /// Get all CIDs in the store.
     pub async fn list_cids(&self) -> Vec<Cid> {
         let db = Arc::clone(&self.db);
 
-        tokio::task::spawn_blocking(move || {
+        tokio::task::spawn_blocking(move || -> Result<Vec<Cid>, StorageError> {
+            let read_txn = db.begin_read().map_err(Self::db_err)?;
+            let table = read_txn.open_table(BLOCKS_TABLE).map_err(Self::db_err)?;
             let mut cids = Vec::new();
-            let iter = db.iterator(rocksdb::IteratorMode::Start);
 
-            for (key, _) in iter.flatten() {
-                if let Ok(key_str) = String::from_utf8(key.to_vec()) {
-                    if let Ok(cid) = key_str.parse::<Cid>() {
-                        cids.push(cid);
-                    }
+            for entry in table.iter().map_err(Self::db_err)? {
+                let (key, _) = entry.map_err(Self::db_err)?;
+                if let Ok(cid) = key.value().parse::<Cid>() {
+                    cids.push(cid);
                 }
             }
 
-            cids
+            Ok(cids)
         })
         .await
-        .unwrap_or_default()
+        .map_err(|e| StorageError::IoError(std::io::Error::other(e.to_string())))
+        .and_then(|r| r)
+        .unwrap_or_else(|e| {
+            warn!("Failed to list CIDs from {:?}: {}", self.db_path, e);
+            Vec::new()
+        })
     }
 
-    /// Get statistics about the block store
+    /// Get statistics about the block store.
     pub async fn stats(&self) -> BlockStoreStats {
         let db = Arc::clone(&self.db);
 
-        tokio::task::spawn_blocking(move || {
-            let mut block_count = 0;
-            let mut total_size = 0;
+        tokio::task::spawn_blocking(move || -> Result<BlockStoreStats, StorageError> {
+            let read_txn = db.begin_read().map_err(Self::db_err)?;
+            let table = read_txn.open_table(BLOCKS_TABLE).map_err(Self::db_err)?;
+            let mut block_count = 0usize;
+            let mut total_size = 0usize;
 
-            let iter = db.iterator(rocksdb::IteratorMode::Start);
-            for (_, value) in iter.flatten() {
+            for entry in table.iter().map_err(Self::db_err)? {
+                let (_, value) = entry.map_err(Self::db_err)?;
                 block_count += 1;
-                total_size += value.len();
+                total_size += value.value().len();
             }
 
-            BlockStoreStats {
+            Ok(BlockStoreStats {
                 block_count,
                 total_size,
-            }
+            })
         })
         .await
-        .unwrap_or(BlockStoreStats {
-            block_count: 0,
-            total_size: 0,
+        .map_err(|e| StorageError::IoError(std::io::Error::other(e.to_string())))
+        .and_then(|r| r)
+        .unwrap_or_else(|e| {
+            warn!("Failed to compute store stats from {:?}: {}", self.db_path, e);
+            BlockStoreStats {
+                block_count: 0,
+                total_size: 0,
+            }
         })
     }
 
-    /// Clear all blocks
+    /// Clear all blocks.
     pub async fn clear(&self) {
         let db = Arc::clone(&self.db);
+        let db_path = self.db_path.clone();
 
-        tokio::task::spawn_blocking(move || {
-            let mut batch = WriteBatch::default();
-            let iter = db.iterator(rocksdb::IteratorMode::Start);
+        let res = tokio::task::spawn_blocking(move || -> Result<(), StorageError> {
+            let write_txn = db.begin_write().map_err(Self::db_err)?;
+            {
+                let mut table = write_txn.open_table(BLOCKS_TABLE).map_err(Self::db_err)?;
+                let mut keys = Vec::new();
+                for entry in table.iter().map_err(Self::db_err)? {
+                    let (key, _) = entry.map_err(Self::db_err)?;
+                    keys.push(key.value().to_string());
+                }
 
-            for (key, _) in iter.flatten() {
-                batch.delete(&key);
+                for key in keys {
+                    let _ = table.remove(key.as_str()).map_err(Self::db_err)?;
+                }
             }
-
-            let _ = db.write(batch);
+            write_txn.commit().map_err(Self::db_err)?;
+            Ok(())
         })
         .await
-        .ok();
+        .map_err(|e| StorageError::IoError(std::io::Error::other(e.to_string())))
+        .and_then(|r| r);
 
-        info!("Cleared all blocks from store");
+        match res {
+            Ok(()) => info!("Cleared all blocks from store"),
+            Err(e) => warn!("Failed to clear store at {:?}: {}", db_path, e),
+        }
     }
 }
 
@@ -500,106 +517,5 @@ mod tests {
         let stats = store.stats().await;
         assert_eq!(stats.block_count, 1);
         assert_eq!(stats.total_size, 1024 * 1024);
-    }
-
-    #[tokio::test]
-    async fn test_on_block_stored_callback() {
-        use std::sync::Mutex;
-
-        let mut store = BlockStore::new();
-
-        // Track which CIDs were announced via callback
-        let announced_cids = Arc::new(Mutex::new(Vec::new()));
-        let announced_cids_clone = Arc::clone(&announced_cids);
-
-        // Register callback
-        store.set_on_block_stored(Arc::new(move |cid| {
-            announced_cids_clone.lock().unwrap().push(cid);
-        }));
-
-        // Store some blocks
-        let data1 = b"hello world".to_vec();
-        let data2 = b"goodbye world".to_vec();
-
-        let block1 = Block::new(data1).unwrap();
-        let block2 = Block::new(data2).unwrap();
-        let cid1 = block1.cid;
-        let cid2 = block2.cid;
-
-        store.put(block1).await.unwrap();
-        store.put(block2).await.unwrap();
-
-        // Wait a bit for async callbacks to complete
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-
-        // Verify both blocks were announced
-        let announced = announced_cids.lock().unwrap();
-        assert_eq!(announced.len(), 2);
-        assert!(announced.contains(&cid1));
-        assert!(announced.contains(&cid2));
-    }
-
-    #[tokio::test]
-    async fn test_callback_not_invoked_for_duplicate_blocks() {
-        use std::sync::Mutex;
-
-        let mut store = BlockStore::new();
-
-        // Track callback invocations
-        let callback_count = Arc::new(Mutex::new(0u32));
-        let callback_count_clone = Arc::clone(&callback_count);
-
-        store.set_on_block_stored(Arc::new(move |_cid| {
-            *callback_count_clone.lock().unwrap() += 1;
-        }));
-
-        let data = b"hello world".to_vec();
-        let block = Block::new(data).unwrap();
-
-        // Store same block twice
-        store.put(block.clone()).await.unwrap();
-        store.put(block.clone()).await.unwrap();
-
-        // Wait for async callbacks
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-
-        // Should only be called once (not for duplicate)
-        assert_eq!(*callback_count.lock().unwrap(), 1);
-    }
-
-    #[tokio::test]
-    async fn test_callback_does_not_block_storage() {
-        use std::sync::Mutex;
-        use std::time::Instant;
-
-        let mut store = BlockStore::new();
-
-        // Register a slow callback (simulates network announcement)
-        let slow_callback_done = Arc::new(Mutex::new(false));
-        let slow_callback_done_clone = Arc::clone(&slow_callback_done);
-
-        store.set_on_block_stored(Arc::new(move |_cid| {
-            // Simulate slow network operation
-            std::thread::sleep(std::time::Duration::from_millis(500));
-            *slow_callback_done_clone.lock().unwrap() = true;
-        }));
-
-        let data = b"hello world".to_vec();
-        let block = Block::new(data).unwrap();
-
-        // Measure storage time
-        let start = Instant::now();
-        store.put(block).await.unwrap();
-        let storage_duration = start.elapsed();
-
-        // Storage should complete quickly (not wait for callback)
-        assert!(storage_duration < tokio::time::Duration::from_millis(100));
-
-        // Callback should still not be done yet
-        assert!(!*slow_callback_done.lock().unwrap());
-
-        // Wait for callback to complete
-        tokio::time::sleep(tokio::time::Duration::from_millis(600)).await;
-        assert!(*slow_callback_done.lock().unwrap());
     }
 }

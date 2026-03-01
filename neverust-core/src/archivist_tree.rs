@@ -138,7 +138,10 @@ impl ArchivistTree {
         // Build the tree layers
         let layers = Self::build_layers(leaves)?;
 
-        Ok(Self { layers, block_cids })
+        Ok(Self {
+            layers,
+            block_cids,
+        })
     }
 
     /// Build all layers of the Merkle tree
@@ -206,7 +209,7 @@ impl ArchivistTree {
         let mut hasher = Sha256::new();
         hasher.update(left);
         hasher.update(right);
-        hasher.update([key as u8]);
+        hasher.update(&[key as u8]);
         Ok(hasher.finalize().to_vec())
     }
 
@@ -214,7 +217,10 @@ impl ArchivistTree {
     ///
     /// Returns the CID of the tree root using DatasetRootCodec (0xcd03)
     pub fn root_cid(&self) -> Result<Cid> {
-        let root_layer = self.layers.last().ok_or(ArchivistTreeError::NoLayers)?;
+        let root_layer = self
+            .layers
+            .last()
+            .ok_or(ArchivistTreeError::NoLayers)?;
 
         if root_layer.len() != 1 {
             return Err(ArchivistTreeError::InvalidRootLayer {
@@ -288,7 +294,10 @@ impl ArchivistTree {
 
     /// Get the number of leaves in the tree
     pub fn leaves_count(&self) -> usize {
-        self.layers.first().map(|layer| layer.len()).unwrap_or(0)
+        self.layers
+            .first()
+            .map(|layer| layer.len())
+            .unwrap_or(0)
     }
 
     /// Get the depth of the tree (number of layers - 1)
@@ -335,8 +344,7 @@ impl ArchivistTree {
 
         // Read count
         let mut count_bytes = [0u8; 4];
-        cursor
-            .read_exact(&mut count_bytes)
+        cursor.read_exact(&mut count_bytes)
             .map_err(|e| ArchivistTreeError::CidError(format!("Failed to read count: {}", e)))?;
         let count = u32::from_le_bytes(count_bytes) as usize;
 
@@ -345,16 +353,14 @@ impl ArchivistTree {
         for _ in 0..count {
             // Read CID length
             let mut len_bytes = [0u8; 4];
-            cursor.read_exact(&mut len_bytes).map_err(|e| {
-                ArchivistTreeError::CidError(format!("Failed to read CID length: {}", e))
-            })?;
+            cursor.read_exact(&mut len_bytes)
+                .map_err(|e| ArchivistTreeError::CidError(format!("Failed to read CID length: {}", e)))?;
             let len = u32::from_le_bytes(len_bytes) as usize;
 
             // Read CID bytes
             let mut cid_bytes = vec![0u8; len];
-            cursor.read_exact(&mut cid_bytes).map_err(|e| {
-                ArchivistTreeError::CidError(format!("Failed to read CID bytes: {}", e))
-            })?;
+            cursor.read_exact(&mut cid_bytes)
+                .map_err(|e| ArchivistTreeError::CidError(format!("Failed to read CID bytes: {}", e)))?;
 
             // Parse CID
             let cid = Cid::try_from(cid_bytes)
@@ -376,7 +382,11 @@ impl ArchivistTree {
     /// # Returns
     ///
     /// `Ok(true)` if the proof is valid, `Ok(false)` otherwise
-    pub fn verify_proof(proof: &ArchivistProof, leaf: &[u8], expected_root: &[u8]) -> Result<bool> {
+    pub fn verify_proof(
+        proof: &ArchivistProof,
+        leaf: &[u8],
+        expected_root: &[u8],
+    ) -> Result<bool> {
         let reconstructed = Self::reconstruct_root(&proof.path, proof.nleaves, proof.index, leaf)?;
         Ok(reconstructed == expected_root)
     }
@@ -428,7 +438,7 @@ mod tests {
 
     /// Helper to create a test CID from data
     fn create_block_cid(data: &[u8]) -> Cid {
-        use sha2::{Digest, Sha256};
+        use sha2::{Sha256, Digest};
         let mut hasher = Sha256::new();
         hasher.update(data);
         let hash = hasher.finalize();
@@ -447,7 +457,8 @@ mod tests {
     fn test_tree_with_1_block() {
         // Create a tree with a single block
         let block_cid = create_block_cid(b"test block 0");
-        let tree = ArchivistTree::new(vec![block_cid.clone()]).expect("Failed to create tree");
+        let tree = ArchivistTree::new(vec![block_cid.clone()])
+            .expect("Failed to create tree");
 
         // Check tree properties
         assert_eq!(tree.leaves_count(), 1);
@@ -477,7 +488,8 @@ mod tests {
             .map(|i| create_block_cid(format!("test block {}", i).as_bytes()))
             .collect();
 
-        let tree = ArchivistTree::new(block_cids.clone()).expect("Failed to create tree");
+        let tree = ArchivistTree::new(block_cids.clone())
+            .expect("Failed to create tree");
 
         // Check tree properties
         assert_eq!(tree.leaves_count(), 3);
@@ -491,8 +503,7 @@ mod tests {
         // Test proofs for all blocks
         let root_hash = root_cid.hash().digest();
         for (i, block_cid) in block_cids.iter().enumerate() {
-            let proof = tree
-                .get_proof(i)
+            let proof = tree.get_proof(i)
                 .unwrap_or_else(|_| panic!("Failed to get proof for block {}", i));
             assert_eq!(proof.path.len(), 2, "Expected depth 2 for block {}", i);
 
@@ -510,7 +521,8 @@ mod tests {
             .map(|i| create_block_cid(format!("test block {}", i).as_bytes()))
             .collect();
 
-        let tree = ArchivistTree::new(block_cids.clone()).expect("Failed to create tree");
+        let tree = ArchivistTree::new(block_cids.clone())
+            .expect("Failed to create tree");
 
         // Check tree properties
         assert_eq!(tree.leaves_count(), 100);
@@ -527,8 +539,7 @@ mod tests {
         let root_hash = root_cid.hash().digest();
 
         for &i in &test_indices {
-            let proof = tree
-                .get_proof(i)
+            let proof = tree.get_proof(i)
                 .unwrap_or_else(|_| panic!("Failed to get proof for block {}", i));
             assert!(
                 !proof.path.is_empty(),
@@ -546,7 +557,8 @@ mod tests {
     #[test]
     fn test_proof_out_of_bounds() {
         let block_cid = create_block_cid(b"test block 0");
-        let tree = ArchivistTree::new(vec![block_cid]).expect("Failed to create tree");
+        let tree = ArchivistTree::new(vec![block_cid])
+            .expect("Failed to create tree");
 
         let result = tree.get_proof(1);
         assert!(result.is_err());
@@ -560,7 +572,8 @@ mod tests {
             .map(|i| create_block_cid(format!("test block {}", i).as_bytes()))
             .collect();
 
-        let tree = ArchivistTree::new(block_cids.clone()).expect("Failed to create tree");
+        let tree = ArchivistTree::new(block_cids.clone())
+            .expect("Failed to create tree");
 
         let root_cid = tree.root_cid().expect("Failed to get root CID");
         let root_hash = root_cid.hash().digest();
@@ -583,13 +596,10 @@ mod tests {
         let block_cid = create_block_cid(b"test");
         assert_eq!(block_cid.codec(), 0xcd02, "BlockCodec should be 0xcd02");
 
-        let tree = ArchivistTree::new(vec![block_cid]).expect("Failed to create tree");
+        let tree = ArchivistTree::new(vec![block_cid])
+            .expect("Failed to create tree");
         let root_cid = tree.root_cid().expect("Failed to get root CID");
-        assert_eq!(
-            root_cid.codec(),
-            0xcd03,
-            "DatasetRootCodec should be 0xcd03"
-        );
+        assert_eq!(root_cid.codec(), 0xcd03, "DatasetRootCodec should be 0xcd03");
     }
 
     #[test]
@@ -600,7 +610,8 @@ mod tests {
                 .map(|i| create_block_cid(format!("block {}", i).as_bytes()))
                 .collect();
 
-            let tree = ArchivistTree::new(block_cids.clone()).expect("Failed to create tree");
+            let tree = ArchivistTree::new(block_cids.clone())
+                .expect("Failed to create tree");
 
             assert_eq!(tree.leaves_count(), count);
 
@@ -616,7 +627,8 @@ mod tests {
                 assert!(
                     is_valid,
                     "Proof verification failed for block {} in {}-block tree",
-                    i, count
+                    i,
+                    count
                 );
             }
         }
@@ -629,7 +641,8 @@ mod tests {
             .map(|i| create_block_cid(format!("block {}", i).as_bytes()))
             .collect();
 
-        let tree = ArchivistTree::new(block_cids.clone()).expect("Failed to create tree");
+        let tree = ArchivistTree::new(block_cids.clone())
+            .expect("Failed to create tree");
 
         // Verify getter returns same CIDs in order
         let retrieved_cids = tree.block_cids();
@@ -646,7 +659,8 @@ mod tests {
             .map(|i| create_block_cid(format!("test block {}", i).as_bytes()))
             .collect();
 
-        let tree = ArchivistTree::new(block_cids.clone()).expect("Failed to create tree");
+        let tree = ArchivistTree::new(block_cids.clone())
+            .expect("Failed to create tree");
 
         // Serialize block list
         let serialized = tree.serialize_block_list();
@@ -666,11 +680,12 @@ mod tests {
     #[test]
     fn test_serialize_deserialize_single_block() {
         let block_cid = create_block_cid(b"single block");
-        let tree = ArchivistTree::new(vec![block_cid]).expect("Failed to create tree");
+        let tree = ArchivistTree::new(vec![block_cid])
+            .expect("Failed to create tree");
 
         let serialized = tree.serialize_block_list();
-        let deserialized =
-            ArchivistTree::deserialize_block_list(&serialized).expect("Failed to deserialize");
+        let deserialized = ArchivistTree::deserialize_block_list(&serialized)
+            .expect("Failed to deserialize");
 
         assert_eq!(deserialized.len(), 1);
         assert_eq!(deserialized[0], block_cid);
@@ -683,7 +698,8 @@ mod tests {
             .map(|i| create_block_cid(format!("block {}", i).as_bytes()))
             .collect();
 
-        let tree = ArchivistTree::new(block_cids.clone()).expect("Failed to create tree");
+        let tree = ArchivistTree::new(block_cids.clone())
+            .expect("Failed to create tree");
 
         let serialized = tree.serialize_block_list();
         let deserialized = ArchivistTree::deserialize_block_list(&serialized)

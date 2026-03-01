@@ -65,6 +65,42 @@ pub struct HealthResponse {
     pub total_bytes: usize,
 }
 
+/// Manifest view compatible with Archivist DataItem schema
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ManifestItemResponse {
+    pub tree_cid: String,
+    pub dataset_size: u64,
+    pub block_size: u64,
+    #[serde(rename = "protected")]
+    pub is_protected: bool,
+    pub filename: Option<String>,
+    pub mimetype: Option<String>,
+}
+
+/// Archivist DataItem
+#[derive(Serialize, Deserialize)]
+pub struct DataItemResponse {
+    pub cid: String,
+    pub manifest: ManifestItemResponse,
+}
+
+/// Archivist DataList
+#[derive(Serialize, Deserialize)]
+pub struct DataListResponse {
+    pub content: Vec<DataItemResponse>,
+}
+
+/// Archivist Space response
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SpaceResponse {
+    pub total_blocks: usize,
+    pub quota_max_bytes: usize,
+    pub quota_used_bytes: usize,
+    pub quota_reserved_bytes: usize,
+}
+
 /// Error response
 #[derive(Serialize)]
 pub struct ErrorResponse {
@@ -95,36 +131,72 @@ pub fn create_router(
         .route("/api/v1/blocks", post(store_block))
         .route("/api/v1/blocks/:cid", get(get_block))
         // Archivist-compatible endpoints
-        .route("/api/archivist/v1/data", post(archivist_upload))
+        .route(
+            "/api/archivist/v1/data",
+            get(archivist_list_data).post(archivist_upload),
+        )
+        .route(
+            "/api/archivist/v1/data/:cid",
+            get(archivist_download_local).delete(archivist_delete),
+        )
+        .route(
+            "/api/archivist/v1/data/:cid/network",
+            post(archivist_download_network_manifest),
+        )
         .route(
             "/api/archivist/v1/data/:cid/network/stream",
             get(archivist_download),
         )
-        .route("/api/archivist/v1/data", get(list_manifests))
-        .route("/api/archivist/v1/data/:cid", get(download_local))
-        .route(
-            "/api/archivist/v1/data/:cid/network",
-            post(download_network),
-        )
         .route(
             "/api/archivist/v1/data/:cid/network/manifest",
-            get(download_manifest),
+            get(archivist_download_network_manifest),
         )
-        .route("/api/archivist/v1/space", get(storage_space))
-        .route(
-            "/api/archivist/v1/sales/availability",
-            get(sales_availability),
-        )
-        .route("/api/archivist/v1/sales/availability", post(offer_storage))
-        .route(
-            "/api/archivist/v1/storage/request/:cid",
-            post(create_storage_request),
-        )
-        .route("/api/archivist/v1/storage/purchases", get(get_purchases))
-        .route("/api/archivist/v1/storage/purchases/:id", get(get_purchase))
+        .route("/api/archivist/v1/space", get(archivist_space))
         .route("/api/archivist/v1/peer-id", get(peer_id_endpoint))
+        .route("/api/archivist/v1/peerid", get(peer_id_endpoint))
         .route("/api/archivist/v1/stats", get(archivist_stats))
         .route("/api/archivist/v1/spr", get(spr_endpoint))
+        .route("/api/archivist/v1/connect/:peer_id", get(connect_not_supported))
+        .route(
+            "/api/archivist/v1/sales/slots",
+            get(marketplace_persistence_disabled),
+        )
+        .route(
+            "/api/archivist/v1/sales/slots/:slot_id",
+            get(marketplace_persistence_disabled),
+        )
+        .route(
+            "/api/archivist/v1/sales/availability",
+            get(marketplace_persistence_disabled).post(marketplace_persistence_disabled),
+        )
+        .route(
+            "/api/archivist/v1/storage/request/:cid",
+            post(marketplace_persistence_disabled),
+        )
+        .route(
+            "/api/archivist/v1/storage/purchases",
+            get(marketplace_persistence_disabled),
+        )
+        .route(
+            "/api/archivist/v1/storage/purchases/:id",
+            get(marketplace_persistence_disabled),
+        )
+        .route(
+            "/api/archivist/v1/debug/info",
+            get(debug_info_endpoint),
+        )
+        .route(
+            "/api/archivist/v1/debug/chronicles/loglevel",
+            post(loglevel_not_supported),
+        )
+        .route(
+            "/api/archivist/v1/debug/peer/:peer_id",
+            get(debug_peer_not_supported),
+        )
+        .route(
+            "/api/archivist/v1/debug/testing/option/:key/:value",
+            post(debug_testing_not_supported),
+        )
         .with_state(state)
         .layer(TraceLayer::new_for_http())
 }
@@ -299,6 +371,235 @@ fn parse_range_header(range_str: &str, total_size: usize) -> Option<(usize, usiz
     Some((start, end))
 }
 
+fn manifest_to_response(cid: &Cid, manifest: &Manifest) -> DataItemResponse {
+    DataItemResponse {
+        cid: cid_to_string(cid),
+        manifest: ManifestItemResponse {
+            tree_cid: cid_to_string(&manifest.tree_cid),
+            dataset_size: manifest.dataset_size,
+            block_size: manifest.block_size,
+            is_protected: manifest.is_protected(),
+            filename: manifest.filename.clone(),
+            mimetype: manifest.mimetype.clone(),
+        },
+    }
+}
+
+fn metadata_cid_from_manifest(manifest: &Manifest) -> Option<Cid> {
+    manifest
+        .filename
+        .as_ref()
+        .and_then(|s| s.strip_prefix("metadata:"))
+        .and_then(|s| s.parse().ok())
+}
+
+async fn retrieve_local_cid_data(state: &ApiState, cid: &Cid, cid_str: &str) -> Result<Vec<u8>, ApiError> {
+    let block = state.block_store.get(cid).await.map_err(|e| match e {
+        StorageError::BlockNotFound(_) => ApiError::NotFound(cid_str.to_string()),
+        _ => ApiError::Internal(format!("Failed to retrieve block: {}", e)),
+    })?;
+
+    // Manifests need local block reconstruction.
+    if cid.codec() == 0xcd01 {
+        let manifest = Manifest::from_block(&block)
+            .map_err(|e| ApiError::Internal(format!("Failed to decode manifest: {}", e)))?;
+
+        let metadata_cid = metadata_cid_from_manifest(&manifest).ok_or_else(|| {
+            ApiError::Internal("Manifest missing metadata CID in filename field".to_string())
+        })?;
+
+        let tree_metadata_block = state.block_store.get(&metadata_cid).await.map_err(|e| match e {
+            StorageError::BlockNotFound(_) => {
+                ApiError::NotFound(format!("metadata for manifest {} not found", cid_str))
+            }
+            _ => ApiError::Internal(format!("Failed to fetch tree metadata {}: {}", metadata_cid, e)),
+        })?;
+
+        let block_cids = ArchivistTree::deserialize_block_list(&tree_metadata_block.data)
+            .map_err(|e| ApiError::Internal(format!("Failed to deserialize tree metadata: {}", e)))?;
+
+        if block_cids.len() != manifest.blocks_count() {
+            return Err(ApiError::Internal(format!(
+                "Block count mismatch: tree has {} blocks but manifest expects {}",
+                block_cids.len(),
+                manifest.blocks_count()
+            )));
+        }
+
+        let mut data: Vec<u8> = Vec::with_capacity(manifest.dataset_size as usize);
+        for block_cid in &block_cids {
+            let b = state.block_store.get(block_cid).await.map_err(|e| match e {
+                StorageError::BlockNotFound(_) => {
+                    ApiError::NotFound(format!("manifest block {} not found", block_cid))
+                }
+                _ => ApiError::Internal(format!("Failed to fetch block {}: {}", block_cid, e)),
+            })?;
+            data.extend_from_slice(&b.data);
+        }
+
+        if data.len() != manifest.dataset_size as usize {
+            return Err(ApiError::Internal(format!(
+                "Data size mismatch: assembled {} bytes but manifest expects {} bytes",
+                data.len(),
+                manifest.dataset_size
+            )));
+        }
+
+        Ok(data)
+    } else {
+        Ok(block.data)
+    }
+}
+
+/// Archivist list data endpoint (GET /api/archivist/v1/data)
+async fn archivist_list_data(State(state): State<ApiState>) -> impl IntoResponse {
+    let mut content = Vec::new();
+
+    for cid in state.block_store.list_cids().await {
+        if cid.codec() != 0xcd01 {
+            continue;
+        }
+
+        if let Ok(block) = state.block_store.get(&cid).await {
+            if let Ok(manifest) = Manifest::from_block(&block) {
+                content.push(manifest_to_response(&cid, &manifest));
+            }
+        }
+    }
+
+    Json(DataListResponse { content })
+}
+
+/// Archivist local download endpoint (GET /api/archivist/v1/data/:cid)
+async fn archivist_download_local(
+    State(state): State<ApiState>,
+    Path(cid_str): Path<String>,
+) -> Result<Vec<u8>, ApiError> {
+    let cid = cid_str
+        .parse()
+        .map_err(|e| ApiError::BadRequest(format!("Invalid CID: {}", e)))?;
+
+    retrieve_local_cid_data(&state, &cid, &cid_str).await
+}
+
+/// Archivist delete endpoint (DELETE /api/archivist/v1/data/:cid)
+async fn archivist_delete(
+    State(state): State<ApiState>,
+    Path(cid_str): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    let cid: Cid = cid_str
+        .parse()
+        .map_err(|e| ApiError::BadRequest(format!("Invalid CID: {}", e)))?;
+
+    if cid.codec() == 0xcd01 {
+        if let Ok(manifest_block) = state.block_store.get(&cid).await {
+            if let Ok(manifest) = Manifest::from_block(&manifest_block) {
+                if let Some(metadata_cid) = metadata_cid_from_manifest(&manifest) {
+                    if let Ok(metadata_block) = state.block_store.get(&metadata_cid).await {
+                        if let Ok(block_cids) =
+                            ArchivistTree::deserialize_block_list(&metadata_block.data)
+                        {
+                            for block_cid in block_cids {
+                                let _ = state.block_store.delete(&block_cid).await;
+                            }
+                        }
+                    }
+                    let _ = state.block_store.delete(&metadata_cid).await;
+                }
+            }
+        }
+    }
+
+    // Deleting non-existing data is idempotent and still returns 204.
+    let _ = state.block_store.delete(&cid).await;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Archivist network manifest endpoint
+/// (GET/POST /api/archivist/v1/data/:cid/network/manifest, /network)
+async fn archivist_download_network_manifest(
+    State(state): State<ApiState>,
+    Path(cid_str): Path<String>,
+) -> Result<Json<DataItemResponse>, ApiError> {
+    let cid: Cid = cid_str
+        .parse()
+        .map_err(|e| ApiError::BadRequest(format!("Invalid CID: {}", e)))?;
+
+    let block = state.block_store.get(&cid).await.map_err(|e| match e {
+        StorageError::BlockNotFound(_) => ApiError::NotFound(cid_str.clone()),
+        _ => ApiError::Internal(format!("Failed to retrieve manifest: {}", e)),
+    })?;
+
+    let manifest = Manifest::from_block(&block)
+        .map_err(|e| ApiError::Internal(format!("Failed to decode manifest: {}", e)))?;
+
+    Ok(Json(manifest_to_response(&cid, &manifest)))
+}
+
+/// Archivist space endpoint (GET /api/archivist/v1/space)
+async fn archivist_space(State(state): State<ApiState>) -> impl IntoResponse {
+    let stats = state.block_store.stats().await;
+
+    Json(SpaceResponse {
+        total_blocks: stats.block_count,
+        quota_max_bytes: stats.total_size,
+        quota_used_bytes: stats.total_size,
+        quota_reserved_bytes: 0,
+    })
+}
+
+/// Placeholder until libp2p connect orchestration is exposed in API state.
+async fn connect_not_supported() -> Result<StatusCode, ApiError> {
+    Err(ApiError::NotImplemented(
+        "Peer connect API is not wired yet in neverust runtime".to_string(),
+    ))
+}
+
+/// Placeholder for marketplace-dependent APIs.
+async fn marketplace_persistence_disabled() -> Result<StatusCode, ApiError> {
+    Err(ApiError::ServiceUnavailable(
+        "Persistence is not enabled".to_string(),
+    ))
+}
+
+/// Lightweight debug info endpoint for compatibility.
+async fn debug_info_endpoint(State(state): State<ApiState>) -> impl IntoResponse {
+    let addrs = state
+        .listen_addrs
+        .read()
+        .map(|v| v.iter().map(ToString::to_string).collect::<Vec<_>>())
+        .unwrap_or_default();
+
+    Json(serde_json::json!({
+        "id": state.peer_id,
+        "addrs": addrs,
+        "repo": "unknown",
+        "spr": "",
+        "announceAddresses": [],
+        "ethAddress": serde_json::Value::Null,
+        "table": {"localNode": serde_json::Value::Null, "nodes": []},
+        "archivist": {"version": env!("CARGO_PKG_VERSION"), "revision": "unknown", "contracts": "unknown"}
+    }))
+}
+
+async fn loglevel_not_supported() -> Result<StatusCode, ApiError> {
+    Err(ApiError::NotImplemented(
+        "Runtime log level updates are not implemented".to_string(),
+    ))
+}
+
+async fn debug_peer_not_supported() -> Result<StatusCode, ApiError> {
+    Err(ApiError::NotImplemented(
+        "Debug peer lookup is not implemented".to_string(),
+    ))
+}
+
+async fn debug_testing_not_supported() -> Result<StatusCode, ApiError> {
+    Err(ApiError::NotImplemented(
+        "System testing options are not implemented".to_string(),
+    ))
+}
+
 /// Archivist-compatible upload endpoint (POST /api/archivist/v1/data)
 /// Returns manifest CID as plain text
 async fn archivist_upload(
@@ -391,11 +692,11 @@ async fn archivist_upload(
         tree_cid,
         chunker.chunk_size() as u64,
         dataset_size as u64,
-        None,                                            // codec (uses default 0xcd02)
-        None,                                            // hcodec (uses default SHA-256)
-        None,                                            // version (uses default 1)
+        None, // codec (uses default 0xcd02)
+        None, // hcodec (uses default SHA-256)
+        None, // version (uses default 1)
         Some(format!("metadata:{}", tree_metadata_cid)), // filename (stores metadata CID)
-        None,                                            // mimetype
+        None, // mimetype
     );
 
     info!(
@@ -444,147 +745,10 @@ async fn archivist_download(
         .parse()
         .map_err(|e| ApiError::BadRequest(format!("Invalid CID: {}", e)))?;
 
-    // Try to get block from local store first
-    match state.block_store.get(&cid).await {
-        Ok(block) => {
-            // Check if this is a manifest (codec 0xcd01) or a data block (codec 0xcd02)
-            if cid.codec() == 0xcd01 {
-                // This is a manifest - decode it and fetch the actual data
-                info!(
-                    "Archivist API: {} is a manifest, decoding to get data blocks",
-                    cid_str
-                );
-
-                let manifest = Manifest::from_block(&block)
-                    .map_err(|e| ApiError::Internal(format!("Failed to decode manifest: {}", e)))?;
-
-                info!(
-                    "Archivist API: Manifest has {} blocks, dataset size: {} bytes",
-                    manifest.blocks_count(),
-                    manifest.dataset_size
-                );
-
-                // Step 1: Extract metadata CID from manifest filename field
-                let metadata_cid_str = manifest.filename.as_ref().ok_or_else(|| {
-                    ApiError::Internal(
-                        "Manifest missing metadata CID (no filename field)".to_string(),
-                    )
-                })?;
-
-                // Parse metadata CID from "metadata:<cid>" format
-                let metadata_cid_str =
-                    metadata_cid_str.strip_prefix("metadata:").ok_or_else(|| {
-                        ApiError::Internal(format!("Invalid metadata format: {}", metadata_cid_str))
-                    })?;
-
-                let metadata_cid: Cid = metadata_cid_str.parse().map_err(|e| {
-                    ApiError::Internal(format!("Failed to parse metadata CID: {}", e))
-                })?;
-
-                info!("Archivist API: Fetching metadata block {}", metadata_cid);
-
-                // Step 2: Fetch the tree metadata block to get block CIDs
-                let tree_metadata_block =
-                    state.block_store.get(&metadata_cid).await.map_err(|e| {
-                        ApiError::Internal(format!(
-                            "Failed to fetch tree metadata {}: {}",
-                            metadata_cid, e
-                        ))
-                    })?;
-
-                // Step 3: Deserialize block CIDs from metadata
-                let block_cids = ArchivistTree::deserialize_block_list(&tree_metadata_block.data)
-                    .map_err(|e| {
-                    ApiError::Internal(format!("Failed to deserialize tree metadata: {}", e))
-                })?;
-
-                info!(
-                    "Archivist API: Retrieved {} block CIDs from metadata {}",
-                    block_cids.len(),
-                    metadata_cid
-                );
-
-                // Verify block count matches manifest
-                if block_cids.len() != manifest.blocks_count() {
-                    return Err(ApiError::Internal(format!(
-                        "Block count mismatch: tree has {} blocks but manifest expects {}",
-                        block_cids.len(),
-                        manifest.blocks_count()
-                    )));
-                }
-
-                // Step 4: Fetch all blocks and reassemble data
-                let mut data: Vec<u8> = Vec::with_capacity(manifest.dataset_size as usize);
-
-                for (idx, block_cid) in block_cids.iter().enumerate() {
-                    info!(
-                        "Archivist API: Fetching block {}/{}: {}",
-                        idx + 1,
-                        block_cids.len(),
-                        block_cid
-                    );
-
-                    // Try to get block from local store first
-                    let block = match state.block_store.get(block_cid).await {
-                        Ok(b) => b,
-                        Err(StorageError::BlockNotFound(_)) => {
-                            // Block not found - this is an error for manifest downloads
-                            // In production, would fetch from network via BlockExc
-                            return Err(ApiError::Internal(format!(
-                                "Block {} not found (block {}/{})",
-                                block_cid,
-                                idx + 1,
-                                block_cids.len()
-                            )));
-                        }
-                        Err(e) => {
-                            return Err(ApiError::Internal(format!(
-                                "Failed to fetch block {}: {}",
-                                block_cid, e
-                            )));
-                        }
-                    };
-
-                    // Append block data
-                    data.extend_from_slice(&block.data);
-
-                    info!(
-                        "Archivist API: Fetched block {}/{} ({} bytes, total: {} bytes)",
-                        idx + 1,
-                        block_cids.len(),
-                        block.size(),
-                        data.len()
-                    );
-                }
-
-                // Verify final size matches manifest
-                if data.len() != manifest.dataset_size as usize {
-                    return Err(ApiError::Internal(format!(
-                        "Data size mismatch: assembled {} bytes but manifest expects {} bytes",
-                        data.len(),
-                        manifest.dataset_size
-                    )));
-                }
-
-                info!(
-                    "Archivist API: Successfully assembled manifest {} ({} blocks, {} bytes)",
-                    cid_str,
-                    block_cids.len(),
-                    data.len()
-                );
-
-                Ok(data)
-            } else {
-                // This is a data block - return it directly
-                info!(
-                    "Archivist API: Downloaded data block {} from local store ({} bytes)",
-                    cid_str,
-                    block.size()
-                );
-                Ok(block.data)
-            }
-        }
-        Err(StorageError::BlockNotFound(_)) => {
+    // Try to get content from local store first.
+    match retrieve_local_cid_data(&state, &cid, &cid_str).await {
+        Ok(data) => Ok(data),
+        Err(ApiError::NotFound(_)) => {
             // Block not found locally - try fetching from known peers via HTTP
             // This is a temporary solution - in production would use BlockExc/BoTG
             info!(
@@ -649,16 +813,20 @@ async fn archivist_download(
                                         data.len()
                                     );
 
-                                    // Store locally
-                                    let block = Block::new(data.to_vec()).map_err(|e| {
-                                        ApiError::Internal(format!("Failed to create block: {}", e))
-                                    })?;
+                                    // Avoid storing fetched bytes under manifest CID.
+                                    if cid.codec() != 0xcd01 {
+                                        let block = Block::new(data.to_vec()).map_err(|e| {
+                                            ApiError::Internal(format!("Failed to create block: {}", e))
+                                        })?;
 
-                                    state.block_store.put(block.clone()).await.map_err(|e| {
-                                        ApiError::Internal(format!("Failed to store block: {}", e))
-                                    })?;
+                                        state.block_store.put(block.clone()).await.map_err(|e| {
+                                            ApiError::Internal(format!("Failed to store block: {}", e))
+                                        })?;
 
-                                    return Ok(block.data);
+                                        return Ok(block.data);
+                                    }
+
+                                    return Ok(data.to_vec());
                                 }
                                 Err(e) => {
                                     info!(
@@ -687,10 +855,7 @@ async fn archivist_download(
             );
             Err(ApiError::NotFound(cid_str.clone()))
         }
-        Err(e) => Err(ApiError::Internal(format!(
-            "Failed to retrieve block: {}",
-            e
-        ))),
+        Err(e) => Err(e),
     }
 }
 
@@ -711,7 +876,7 @@ async fn archivist_stats(State(state): State<ApiState>) -> impl IntoResponse {
 
 /// SPR endpoint (GET /api/archivist/v1/spr)
 /// Returns the Signed Peer Record for this node
-async fn spr_endpoint(State(state): State<ApiState>) -> impl IntoResponse {
+async fn spr_endpoint(State(state): State<ApiState>) -> Result<String, ApiError> {
     use crate::spr::generate_spr;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -741,23 +906,18 @@ async fn spr_endpoint(State(state): State<ApiState>) -> impl IntoResponse {
         .collect();
 
     if udp_addrs.is_empty() {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
+        return Err(ApiError::Internal(
             "No listen addresses available".to_string(),
-        );
+        ));
     }
 
     // Generate SPR
-    match generate_spr(&state.keypair, &udp_addrs, seq) {
-        Ok(spr) => {
-            info!("Generated SPR for peer {}", state.peer_id);
-            (StatusCode::OK, spr)
-        }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Failed to generate SPR: {}", e),
-        ),
-    }
+    let spr = generate_spr(&state.keypair, &udp_addrs, seq)
+        .map_err(|e| ApiError::Internal(format!("Failed to generate SPR: {}", e)))?;
+
+    info!("Generated SPR for peer {}", state.peer_id);
+
+    Ok(spr)
 }
 
 /// API error type
@@ -765,6 +925,8 @@ async fn spr_endpoint(State(state): State<ApiState>) -> impl IntoResponse {
 enum ApiError {
     BadRequest(String),
     NotFound(String),
+    ServiceUnavailable(String),
+    NotImplemented(String),
     Internal(String),
 }
 
@@ -773,6 +935,8 @@ impl IntoResponse for ApiError {
         let (status, message) = match self {
             ApiError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg),
             ApiError::NotFound(cid) => (StatusCode::NOT_FOUND, format!("Block not found: {}", cid)),
+            ApiError::ServiceUnavailable(msg) => (StatusCode::SERVICE_UNAVAILABLE, msg),
+            ApiError::NotImplemented(msg) => (StatusCode::NOT_IMPLEMENTED, msg),
             ApiError::Internal(msg) => {
                 error!("API error: {}", msg);
                 (StatusCode::INTERNAL_SERVER_ERROR, msg)
@@ -782,151 +946,6 @@ impl IntoResponse for ApiError {
         let body = Json(ErrorResponse { error: message });
         (status, body).into_response()
     }
-}
-
-/// List manifests (GET /api/archivist/v1/data)
-async fn list_manifests(State(state): State<ApiState>) -> impl IntoResponse {
-    // Get all CIDs from block store
-    let cids = state.block_store.list_cids().await;
-
-    // Filter for manifest CIDs (codec 0xc9)
-    let manifest_cids: Vec<String> = cids
-        .into_iter()
-        .filter(|cid| {
-            // Check if CID has manifest codec (0xc9)
-            cid.to_string().contains("c9")
-        })
-        .map(|cid| cid_to_string(&cid))
-        .collect();
-
-    Json(manifest_cids)
-}
-
-/// Download local data (GET /api/archivist/v1/data/:cid)
-async fn download_local(
-    State(state): State<ApiState>,
-    Path(cid): Path<String>,
-) -> impl IntoResponse {
-    // Parse CID
-    let cid = match cid.parse::<Cid>() {
-        Ok(c) => c,
-        Err(_) => return Err(ApiError::BadRequest(format!("Invalid CID: {}", cid))),
-    };
-
-    // Get block from store
-    match state.block_store.get(&cid).await {
-        Ok(block) => {
-            let mut headers = HeaderMap::new();
-            headers.insert("Content-Type", "application/octet-stream".parse().unwrap());
-            Ok((StatusCode::OK, headers, block.data))
-        }
-        Err(e) => Err(ApiError::Internal(format!("Storage error: {}", e))),
-    }
-}
-
-/// Download from network (POST /api/archivist/v1/data/:cid/network)
-async fn download_network(
-    State(_state): State<ApiState>,
-    Path(cid): Path<String>,
-) -> impl IntoResponse {
-    // Parse CID
-    let cid = match cid.parse::<Cid>() {
-        Ok(c) => c,
-        Err(_) => return Err(ApiError::BadRequest(format!("Invalid CID: {}", cid))),
-    };
-
-    // This would trigger network download via block exchange
-    // For now, return the manifest info if available
-    // TODO: Implement actual network download
-
-    Ok(Json(serde_json::json!({
-        "cid": cid.to_string(),
-        "status": "network_download_triggered"
-    })))
-}
-
-/// Download manifest (GET /api/archivist/v1/data/:cid/network/manifest)
-async fn download_manifest(
-    State(_state): State<ApiState>,
-    Path(cid): Path<String>,
-) -> impl IntoResponse {
-    // Parse CID
-    let cid = match cid.parse::<Cid>() {
-        Ok(c) => c,
-        Err(_) => return Err(ApiError::BadRequest(format!("Invalid CID: {}", cid))),
-    };
-
-    // Get manifest from store
-    // TODO: Implement manifest retrieval
-
-    Ok(Json(serde_json::json!({
-        "cid": cid.to_string(),
-        "tree_cid": cid.to_string(),
-        "block_size": 65536,
-        "dataset_size": 1048576,
-        "codec": 0xcd02,
-        "hcodec": 0x12,
-        "version": 1
-    })))
-}
-
-/// Storage space info (GET /api/archivist/v1/space)
-async fn storage_space(State(state): State<ApiState>) -> impl IntoResponse {
-    let stats = state.block_store.stats().await;
-
-    Json(serde_json::json!({
-        "total": stats.total_size,
-        "used": stats.total_size,
-        "available": 1073741824, // 1GB default
-        "quota": 1073741824
-    }))
-}
-
-/// Sales availability (GET /api/archivist/v1/sales/availability)
-async fn sales_availability(State(_state): State<ApiState>) -> impl IntoResponse {
-    // TODO: Implement marketplace storage availability
-    Json(Vec::<serde_json::Value>::new())
-}
-
-/// Offer storage (POST /api/archivist/v1/sales/availability)
-async fn offer_storage(
-    State(_state): State<ApiState>,
-    Json(payload): Json<serde_json::Value>,
-) -> impl IntoResponse {
-    // TODO: Implement storage offering
-    Json(serde_json::json!({
-        "id": "availability_123",
-        "totalSize": payload["totalSize"],
-        "duration": payload["duration"],
-        "minPricePerBytePerSecond": payload["minPricePerBytePerSecond"]
-    }))
-}
-
-/// Create storage request (POST /api/archivist/v1/storage/request/:cid)
-async fn create_storage_request(
-    State(_state): State<ApiState>,
-    Path(_cid): Path<String>,
-    Json(_payload): Json<serde_json::Value>,
-) -> impl IntoResponse {
-    // TODO: Implement storage request creation
-    Json("request_123".to_string())
-}
-
-/// Get purchases (GET /api/archivist/v1/storage/purchases)
-async fn get_purchases(State(_state): State<ApiState>) -> impl IntoResponse {
-    // TODO: Implement purchase listing
-    Json(Vec::<String>::new())
-}
-
-/// Get purchase details (GET /api/archivist/v1/storage/purchases/:id)
-async fn get_purchase(State(_state): State<ApiState>, Path(id): Path<String>) -> impl IntoResponse {
-    // TODO: Implement purchase details
-    Json(serde_json::json!({
-        "id": id,
-        "status": "active",
-        "cid": "QmTest123",
-        "size": 1048576
-    }))
 }
 
 #[cfg(test)]

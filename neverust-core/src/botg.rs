@@ -18,8 +18,54 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
 use tracing::{debug, error, info, warn};
 
-// Re-export TGP types from Citadel Transfer
-pub use citadel_transfer::{StreamId, TgpConfig, TgpHandle, TransportConfig, TransportHandle};
+/// Stream identifier for BoTG/TGP sessions.
+pub type StreamId = u128;
+
+/// Local compatibility struct for TGP configuration.
+///
+/// The original external `consensus-tgp` crate is not available in this
+/// workspace, so BoTG keeps the config surface locally for now.
+#[derive(Debug, Clone)]
+pub struct TgpConfig {
+    pub stream_id: StreamId,
+    pub epoch: u32,
+    pub local_id: u64,
+    pub peer_id: u64,
+    pub mtu: usize,
+    pub target_mbps: u32,
+}
+
+/// Placeholder handle for an active TGP session.
+#[derive(Debug, Clone)]
+pub struct TgpHandle;
+
+/// UDP transport configuration for BoTG messaging.
+#[derive(Debug, Clone)]
+pub struct TransportConfig {
+    pub bind: SocketAddr,
+    pub batch: usize,
+    pub sndbuf: usize,
+    pub rcvbuf: usize,
+}
+
+/// Lightweight UDP transport handle used by BoTG.
+#[derive(Debug)]
+pub struct TransportHandle {
+    socket: Arc<tokio::net::UdpSocket>,
+}
+
+impl TransportHandle {
+    pub async fn new(config: TransportConfig) -> Result<Self, std::io::Error> {
+        let socket = tokio::net::UdpSocket::bind(config.bind).await?;
+        Ok(Self {
+            socket: Arc::new(socket),
+        })
+    }
+
+    pub fn socket(&self) -> Arc<tokio::net::UdpSocket> {
+        Arc::clone(&self.socket)
+    }
+}
 
 /// BoTG message types for UDP communication
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -257,7 +303,7 @@ impl BoTgProtocol {
     ) -> Result<(Self, Arc<TransportHandle>), BoTgError> {
         info!("BoTG: Creating UDP transport on {}", bind_addr);
 
-        // Create UDP transport via Citadel Transfer
+        // Create UDP transport
         let transport_config = TransportConfig {
             bind: bind_addr,
             batch: 64,               // Batch size for packet processing

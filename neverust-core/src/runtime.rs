@@ -4,13 +4,11 @@
 //! the lifecycle of the P2P node.
 
 use crate::{
-    advertiser::Advertiser,
     api,
     blockexc::BlockExcClient,
     botg::{BoTgConfig, BoTgProtocol},
     config::Config,
     discovery::Discovery,
-    discovery_engine::DiscoveryEngine,
     metrics::Metrics,
     p2p::{create_swarm, P2PError},
     storage::BlockStore,
@@ -24,7 +22,7 @@ use tracing::{error, info, warn};
 
 /// Run the Archivist node with the given configuration
 pub async fn run_node(config: Config) -> Result<(), P2PError> {
-    // Create block store with persistent RocksDB backend
+    // Create block store with persistent redb backend
     let blocks_path = config.data_dir.join("blocks");
     let block_store = Arc::new(
         BlockStore::new_with_path(&blocks_path)
@@ -40,6 +38,7 @@ pub async fn run_node(config: Config) -> Result<(), P2PError> {
     let (mut swarm, block_request_tx, keypair) = create_swarm(
         block_store.clone(),
         config.mode.clone(),
+        config.price_per_byte,
         metrics.clone(),
     )
     .await?;
@@ -57,7 +56,10 @@ pub async fn run_node(config: Config) -> Result<(), P2PError> {
     // Initialize BoTG (Block-over-TGP) protocol for high-speed block exchange
     // Use disc_port + 1 for BoTG since DiscV5 uses disc_port (8090)
     let botg_port = config.disc_port + 1;
-    info!("Initializing BoTG protocol on UDP port {}", botg_port);
+    info!(
+        "Initializing BoTG protocol on UDP port {}",
+        botg_port
+    );
     let botg_config = BoTgConfig {
         local_peer_id: rand::random(), // Generate random peer ID for TGP
         epoch: 0,
@@ -93,10 +95,7 @@ pub async fn run_node(config: Config) -> Result<(), P2PError> {
         .parse()
         .map_err(|e| P2PError::Transport(format!("Invalid DiscV5 address: {}", e)))?;
 
-    info!(
-        "Initializing DiscV5 peer discovery on UDP port {}",
-        config.disc_port
-    );
+    info!("Initializing DiscV5 peer discovery on UDP port {}", config.disc_port);
 
     // Fetch bootstrap ENRs for DiscV5
     let bootstrap_enrs = Config::fetch_bootstrap_enrs()
@@ -106,37 +105,29 @@ pub async fn run_node(config: Config) -> Result<(), P2PError> {
     // Get announce addresses for this node (DiscV5 on disc_port, libp2p on listen_port)
     let announce_addrs = vec![
         format!("/ip4/0.0.0.0/tcp/{}", config.listen_port), // libp2p TCP
-        format!("/ip4/0.0.0.0/udp/{}", config.disc_port),   // DiscV5 UDP
+        format!("/ip4/0.0.0.0/udp/{}", config.disc_port),  // DiscV5 UDP
     ];
 
-    let discovery =
-        match Discovery::new(&keypair, discv5_addr, announce_addrs, bootstrap_enrs).await {
-            Ok(disc) => {
-                info!("DiscV5 initialized successfully on {}", discv5_addr);
-                Arc::new(disc)
-            }
-            Err(e) => {
-                warn!(
-                    "Failed to initialize DiscV5: {}. Continuing without peer discovery.",
-                    e
-                );
-                warn!("This is expected if you're using secp256k1 keys - DiscV5 is optional.");
-                // Continue without DiscV5 - we can still use manual bootstrap nodes
-                // Return early to avoid starting the discovery event loop
-                // (We'll use a None/Option pattern in future iterations)
-                // For now, we just log and continue
-                info!("Continuing without DiscV5 peer discovery");
-                // Create a dummy Arc to satisfy the type system (won't be used)
-                // In future we'll make this Option<Arc<Discovery>>
-                Arc::new(
-                    Discovery::new(&keypair, discv5_addr, vec![], vec![])
-                        .await
-                        .unwrap_or_else(|_| {
-                            panic!("Critical: Could not initialize DiscV5 even with empty config")
-                        }),
-                )
-            }
-        };
+    let discovery = match Discovery::new(&keypair, discv5_addr, announce_addrs, bootstrap_enrs).await {
+        Ok(disc) => {
+            info!("DiscV5 initialized successfully on {}", discv5_addr);
+            Arc::new(disc)
+        }
+        Err(e) => {
+            warn!("Failed to initialize DiscV5: {}. Continuing without peer discovery.", e);
+            warn!("This is expected if you're using secp256k1 keys - DiscV5 is optional.");
+            // Continue without DiscV5 - we can still use manual bootstrap nodes
+            // Return early to avoid starting the discovery event loop
+            // (We'll use a None/Option pattern in future iterations)
+            // For now, we just log and continue
+            info!("Continuing without DiscV5 peer discovery");
+            // Create a dummy Arc to satisfy the type system (won't be used)
+            // In future we'll make this Option<Arc<Discovery>>
+            Arc::new(Discovery::new(&keypair, discv5_addr, vec![], vec![]).await.unwrap_or_else(|_| {
+                panic!("Critical: Could not initialize DiscV5 even with empty config")
+            }))
+        }
+    };
 
     // Start DiscV5 event loop in background
     tokio::spawn({
@@ -146,22 +137,6 @@ pub async fn run_node(config: Config) -> Result<(), P2PError> {
             discovery.run().await;
         }
     });
-
-    // Initialize Advertiser for automatic block announcement
-    let mut advertiser = Advertiser::with_defaults(discovery.clone());
-    advertiser.set_block_store(block_store.clone());
-    let advertiser = Arc::new(advertiser);
-    advertiser
-        .start()
-        .await
-        .map_err(|e| P2PError::Swarm(format!("Failed to start advertiser: {}", e)))?;
-    info!("Advertiser started - will periodically announce blocks to DHT");
-
-    // Initialize DiscoveryEngine for finding block providers
-    let (_discovery_engine, _discovery_tx, _discovery_handle) =
-        DiscoveryEngine::new(discovery.clone());
-    let _discovery_engine = Arc::new(_discovery_engine);
-    info!("DiscoveryEngine initialized for provider lookup");
 
     // Add peers to BoTG for P2P communication (Docker network autodiscovery)
     tokio::spawn({
