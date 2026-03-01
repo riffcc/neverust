@@ -1,11 +1,12 @@
 use axum::body::{to_bytes, Body};
 use axum::http::{Request, StatusCode};
+use cid::Cid;
 use libp2p::identity::Keypair;
-use neverust_core::{api, BlockStore, BoTgConfig, BoTgProtocol, Metrics};
+use neverust_core::{api, ArchivistTree, BlockStore, BoTgConfig, BoTgProtocol, Manifest, Metrics};
 use std::sync::{Arc, RwLock};
 use tower::util::ServiceExt;
 
-fn test_app() -> axum::Router {
+fn test_app() -> (axum::Router, Arc<BlockStore>) {
     let block_store = Arc::new(BlockStore::new());
     let metrics = Metrics::new();
     let peer_id = "12D3KooWParityTest".to_string();
@@ -15,12 +16,21 @@ fn test_app() -> axum::Router {
         .parse()
         .expect("valid multiaddr")]));
 
-    api::create_router(block_store, metrics, peer_id, botg, keypair, listen_addrs)
+    let app = api::create_router(
+        block_store.clone(),
+        metrics,
+        peer_id,
+        botg,
+        keypair,
+        listen_addrs,
+    );
+
+    (app, block_store)
 }
 
 #[tokio::test]
 async fn archivist_endpoint_parity_smoke_test() {
-    let app = test_app();
+    let (app, _) = test_app();
     let payload = b"parity-check-payload".to_vec();
 
     let upload = Request::builder()
@@ -179,4 +189,67 @@ async fn archivist_endpoint_parity_smoke_test() {
         .await
         .expect("local missing response");
     assert_eq!(local_get_missing_resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn local_download_does_not_fetch_missing_blocks_from_network() {
+    let (app, block_store) = test_app();
+    let payload = vec![42u8; 200_000];
+
+    let upload = Request::builder()
+        .method("POST")
+        .uri("/api/archivist/v1/data")
+        .header("content-type", "application/octet-stream")
+        .body(Body::from(payload))
+        .expect("valid upload request");
+    let upload_resp = app.clone().oneshot(upload).await.expect("upload response");
+    assert_eq!(upload_resp.status(), StatusCode::OK);
+
+    let manifest_cid_str = String::from_utf8(
+        to_bytes(upload_resp.into_body(), usize::MAX)
+            .await
+            .expect("upload body")
+            .to_vec(),
+    )
+    .expect("manifest cid text")
+    .trim()
+    .to_string();
+    let manifest_cid: Cid = manifest_cid_str.parse().expect("valid manifest cid");
+
+    let manifest_block = block_store
+        .get(&manifest_cid)
+        .await
+        .expect("manifest should exist");
+    let manifest = Manifest::from_block(&manifest_block).expect("valid manifest");
+    let metadata_cid: Cid = manifest
+        .filename
+        .expect("manifest filename")
+        .strip_prefix("metadata:")
+        .expect("metadata prefix")
+        .parse()
+        .expect("metadata cid");
+
+    let metadata_block = block_store
+        .get(&metadata_cid)
+        .await
+        .expect("metadata should exist");
+    let block_cids = ArchivistTree::deserialize_block_list(&metadata_block.data)
+        .expect("valid metadata block list");
+    assert!(!block_cids.is_empty());
+
+    block_store
+        .delete(&block_cids[0])
+        .await
+        .expect("delete one block");
+
+    let local_get = Request::builder()
+        .uri(format!("/api/archivist/v1/data/{}", manifest_cid_str))
+        .body(Body::empty())
+        .expect("valid local get request");
+    let local_get_resp = app
+        .clone()
+        .oneshot(local_get)
+        .await
+        .expect("local get response");
+    assert_eq!(local_get_resp.status(), StatusCode::NOT_FOUND);
 }
