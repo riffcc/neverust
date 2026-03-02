@@ -10,5 +10,7 @@ lean_lib NeverustProofs where
   roots := #[
     `NeverustProofs.StorageGeometry,
     `NeverustProofs.ProbeAllocation,
-    `NeverustProofs.StripeClasses
+    `NeverustProofs.StripeClasses,
+    `NeverustProofs.GeometryTransfer,
+    `NeverustProofs.Defederation
   ]
