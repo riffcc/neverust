@@ -5,7 +5,7 @@
 
 use futures_util::stream::StreamExt;
 use libp2p::{swarm::SwarmEvent, Multiaddr};
-use neverust_core::{blockexc::BlockExcMode, create_swarm, BlockStore, Config, Metrics};
+use neverust_core::{create_swarm, BlockStore, Config, Metrics};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::timeout;
@@ -54,7 +54,7 @@ async fn test_create_swarm_and_listen() {
     let block_store = Arc::new(BlockStore::new());
     let metrics = Metrics::new();
     let (mut swarm, _tx, _keypair) =
-        create_swarm(block_store, BlockExcMode::Altruistic, metrics)
+        create_swarm(block_store, "altruistic".to_string(), 1, metrics)
             .await
             .expect("Failed to create swarm");
     let peer_id = *swarm.local_peer_id();
@@ -115,7 +115,7 @@ async fn test_dial_bootstrap_node() {
     let block_store = Arc::new(BlockStore::new());
     let metrics = Metrics::new();
     let (mut swarm, _tx, _keypair) =
-        create_swarm(block_store, BlockExcMode::Altruistic, metrics)
+        create_swarm(block_store, "altruistic".to_string(), 1, metrics)
             .await
             .expect("Failed to create swarm");
     let local_peer_id = *swarm.local_peer_id();
@@ -255,7 +255,7 @@ async fn test_connect_and_verify_all_protocols() {
     let block_store = Arc::new(BlockStore::new());
     let metrics = Metrics::new();
     let (mut swarm, _tx, _keypair) =
-        create_swarm(block_store, BlockExcMode::Altruistic, metrics)
+        create_swarm(block_store, "altruistic".to_string(), 1, metrics)
             .await
             .expect("Failed to create swarm");
     info!("📝 Local peer: {}", swarm.local_peer_id());
@@ -430,7 +430,7 @@ async fn test_connect_to_all_bootstrap_nodes() {
         let block_store = Arc::new(BlockStore::new());
         let metrics = Metrics::new();
         let (mut swarm, _tx, _keypair) =
-            create_swarm(block_store, BlockExcMode::Altruistic, metrics)
+            create_swarm(block_store, "altruistic".to_string(), 1, metrics)
                 .await
                 .expect("Failed to create swarm");
 
@@ -510,7 +510,7 @@ async fn test_blockexc_protocol_detailed() {
     let block_store = Arc::new(BlockStore::new());
     let metrics = Metrics::new();
     let (mut swarm, _tx, _keypair) =
-        create_swarm(block_store, BlockExcMode::Altruistic, metrics)
+        create_swarm(block_store, "altruistic".to_string(), 1, metrics)
             .await
             .expect("Failed to create swarm");
     let local_peer_id = *swarm.local_peer_id();

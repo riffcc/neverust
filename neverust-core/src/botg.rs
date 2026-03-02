@@ -203,7 +203,7 @@ impl BoTgProtocol {
     /// Send a BoTG message to a peer via UDP
     async fn send_message(&self, addr: SocketAddr, msg: &BoTgMessage) -> Result<(), BoTgError> {
         if let Some(socket) = &self.udp_socket {
-            let data = bincode::serialize(msg).map_err(|e| {
+            let data = serde_json::to_vec(msg).map_err(|e| {
                 BoTgError::EncodingError(format!("Failed to serialize message: {}", e))
             })?;
 
@@ -484,7 +484,7 @@ impl BoTgProtocol {
                             debug!("BoTG: Received {} bytes from {}", len, peer_addr);
 
                             // Deserialize message
-                            match bincode::deserialize::<BoTgMessage>(&buf[..len]) {
+                            match serde_json::from_slice::<BoTgMessage>(&buf[..len]) {
                                 Ok(msg) => {
                                     if let Err(e) = self.handle_message(peer_addr, msg).await {
                                         warn!(

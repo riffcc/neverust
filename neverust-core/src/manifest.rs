@@ -5,6 +5,7 @@
 
 use cid::Cid;
 use prost::Message as ProstMessage;
+use sha2::{Digest, Sha256};
 use std::io::Cursor;
 use thiserror::Error;
 
@@ -358,28 +359,40 @@ impl Manifest {
     pub fn to_block(&self) -> Result<Block> {
         let data = self.encode()?;
 
-        // Create CID with manifest codec
+        // Create CID with manifest codec:
         // CID = <version><codec><multihash>
-        // Build manifest CID using BLAKE3 multihash
-        let hash = blake3::hash(&data);
-        let hash_bytes = hash.as_bytes();
+        // Use the manifest hash codec for compatibility with peer implementations.
+        let hash_bytes = match self.hcodec {
+            BLAKE3_CODEC => blake3::hash(&data).as_bytes().to_vec(),
+            SHA256_CODEC => {
+                let mut hasher = Sha256::new();
+                hasher.update(&data);
+                hasher.finalize().to_vec()
+            }
+            codec => {
+                return Err(ManifestError::InvalidManifest(format!(
+                    "Unsupported manifest hash codec: 0x{:x}",
+                    codec
+                )))
+            }
+        };
 
         // Build multihash: <hash_code><hash_length><hash_bytes>
         let mut multihash = Vec::new();
-        // BLAKE3 codec (0x1e)
+        // Hash codec
         let mut buf = [0u8; 10];
-        let encoded = unsigned_varint::encode::u64(BLAKE3_CODEC, &mut buf);
+        let encoded = unsigned_varint::encode::u64(self.hcodec, &mut buf);
         multihash.extend_from_slice(encoded);
-        // Hash length (32 bytes)
-        let encoded = unsigned_varint::encode::u64(32, &mut buf);
+        // Hash length
+        let encoded = unsigned_varint::encode::u64(hash_bytes.len() as u64, &mut buf);
         multihash.extend_from_slice(encoded);
         // Hash bytes
-        multihash.extend_from_slice(hash_bytes);
+        multihash.extend_from_slice(&hash_bytes);
 
         // Build CID: <version><codec><multihash>
         let mut cid_bytes = Vec::new();
-        // CID version 1
-        let encoded = unsigned_varint::encode::u64(1, &mut buf);
+        // CID version
+        let encoded = unsigned_varint::encode::u64(self.version as u64, &mut buf);
         cid_bytes.extend_from_slice(encoded);
         // Manifest codec (0xcd01)
         let encoded = unsigned_varint::encode::u64(MANIFEST_CODEC, &mut buf);

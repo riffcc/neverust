@@ -1,11 +1,12 @@
 //! P2P networking layer using rust-libp2p
 //!
-//! Implements the core P2P stack with TCP+Noise+Yamux transports
+//! Implements the core P2P stack with TCP+Noise+Mplex transports
 //! and BlockExc protocol (matching Archivist exactly).
 //!
 //! Identify protocol is used for SPR (Signed Peer Record) exchange.
 
-use libp2p::{identify, noise, tcp, yamux, PeerId, Swarm, SwarmBuilder};
+use libp2p::{identify, noise, tcp, PeerId, Swarm, SwarmBuilder};
+use libp2p_mplex as mplex;
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
@@ -125,15 +126,15 @@ pub async fn create_swarm(
         identify: identify_behaviour,
     };
 
-    // Build swarm with TCP transport to match Archivist testnet nodes
-    // Using TCP+Noise+Yamux
+    // Build swarm with TCP transport to match Archivist nodes.
+    // Archivist uses TCP + Noise + Mplex.
     // Note: Archivist uses 5-minute timeouts - we set this via idle_connection_timeout
     let swarm = SwarmBuilder::with_existing_identity(keypair.clone())
         .with_tokio()
         .with_tcp(
             tcp::Config::default().nodelay(true),
             noise::Config::new,
-            yamux::Config::default,
+            mplex::Config::default,
         )
         .map_err(|e| P2PError::Transport(e.to_string()))?
         .with_behaviour(|_| behaviour)

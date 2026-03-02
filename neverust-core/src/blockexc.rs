@@ -15,7 +15,10 @@ use std::io;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
+use crate::archivist_tree::ArchivistTree;
+use crate::manifest::Manifest;
 use crate::metrics::Metrics;
+use crate::messages::{ArchivistProof, BlockDelivery, BlockPresence, BlockPresenceType, ProofNode, WantType};
 use crate::storage::BlockStore;
 
 pub const PROTOCOL_ID: &str = "/archivist/blockexc/1.0.0";
@@ -77,6 +80,78 @@ async fn write_length_prefixed<W: AsyncWriteExt + Unpin>(
     writer.write_all(data).await?;
     writer.flush().await?;
     Ok(())
+}
+
+async fn resolve_leaf_delivery(
+    block_store: &BlockStore,
+    tree_cid: &Cid,
+    index: u64,
+) -> Option<BlockDelivery> {
+    let idx = usize::try_from(index).ok()?;
+    let all_cids = block_store.list_cids().await;
+
+    for manifest_cid in all_cids {
+        if manifest_cid.codec() != 0xcd01 {
+            continue;
+        }
+
+        let manifest_block = match block_store.get(&manifest_cid).await {
+            Ok(block) => block,
+            Err(_) => continue,
+        };
+
+        let manifest = match Manifest::from_block(&manifest_block) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+
+        if manifest.tree_cid != *tree_cid {
+            continue;
+        }
+
+        let metadata_cid = manifest
+            .filename
+            .as_deref()
+            .and_then(|s| s.strip_prefix("metadata:"))
+            .and_then(|s| s.parse::<Cid>().ok())?;
+
+        let metadata_block = block_store.get(&metadata_cid).await.ok()?;
+        let block_cids = ArchivistTree::deserialize_block_list(&metadata_block.data).ok()?;
+        if idx >= block_cids.len() {
+            return None;
+        }
+
+        let leaf_cid = block_cids[idx];
+        let leaf_block = block_store.get(&leaf_cid).await.ok()?;
+        let tree = ArchivistTree::new(block_cids).ok()?;
+        let proof = tree.get_proof(idx).ok()?;
+        let message_proof = ArchivistProof {
+            mcodec: tree_cid.hash().code(),
+            index,
+            nleaves: proof.nleaves as u64,
+            path: proof
+                .path
+                .into_iter()
+                .map(|hash| ProofNode { hash })
+                .collect(),
+        };
+
+        return Some(BlockDelivery::from_tree_leaf(
+            leaf_cid.to_bytes(),
+            leaf_block.data,
+            tree_cid.to_bytes(),
+            index,
+            message_proof,
+        ));
+    }
+
+    None
+}
+
+async fn has_leaf_block(block_store: &BlockStore, tree_cid: &Cid, index: u64) -> bool {
+    resolve_leaf_delivery(block_store, tree_cid, index)
+        .await
+        .is_some()
 }
 
 /// BlockExc connection handler
@@ -215,7 +290,7 @@ impl ConnectionHandler for BlockExcHandler {
 
                 // Spawn task to handle the stream - read messages from remote peer
                 tokio::spawn(async move {
-                    use crate::messages::{decode_message, encode_message, BlockDelivery, Message};
+                    use crate::messages::{decode_message, encode_message, Message};
                     use cid::Cid;
 
                     let mut stream = stream;
@@ -237,76 +312,164 @@ impl ConnectionHandler for BlockExcHandler {
                                             msg.block_presences.len()
                                         );
 
-                                        // If they sent a wantlist, respond with blocks we have
+                                        // If they sent a wantlist, respond with presences and/or blocks.
                                         if let Some(wantlist) = msg.wantlist {
-                                            use crate::messages::BlockPresence;
-
                                             if mode == "altruistic" {
-                                                // ALTRUISTIC MODE: Serve blocks freely without payment
-                                                info!("BlockExc: ALTRUISTIC MODE - serving blocks freely to {}", peer_id);
+                                                // ALTRUISTIC MODE: follow Archivist semantics.
+                                                info!(
+                                                    "BlockExc: ALTRUISTIC MODE - handling wantlist from {}",
+                                                    peer_id
+                                                );
+
                                                 let mut response_blocks = Vec::new();
+                                                let mut response_presences = Vec::new();
 
                                                 for entry in &wantlist.entries {
-                                                    // Extract CID from BlockAddress
-                                                    if let Some(cid_bytes) = entry.cid_bytes() {
-                                                        if let Ok(cid) = Cid::try_from(cid_bytes) {
-                                                            if let Ok(block) =
-                                                                block_store.get(&cid).await
-                                                            {
-                                                                let total_size =
-                                                                    block.data.len() as u64;
+                                                    if entry.cancel {
+                                                        continue;
+                                                    }
 
-                                                                // Full block request (range retrieval removed per compatibility requirements)
-                                                                info!("BlockExc: Serving full block {} to {} (altruistic) - {} bytes",
-                                                                cid, peer_id, total_size);
+                                                    let Some(address) = entry.address.as_ref() else {
+                                                        continue;
+                                                    };
+                                                    let want_type = WantType::from_i32(entry.want_type)
+                                                        .unwrap_or(WantType::WantHave);
 
-                                                                metrics
-                                                                    .block_sent(block.data.len()); // Track P2P traffic!
-                                                                response_blocks.push(
-                                                                    BlockDelivery::from_cid_and_data(
-                                                                        cid.to_bytes(),
-                                                                        block.data.clone(),
-                                                                    )
-                                                                );
-                                                            } else {
-                                                                debug!(
-                                                                    "BlockExc: Requested block {} not found locally",
-                                                                    cid
-                                                                );
+                                                    if address.leaf {
+                                                        let Ok(tree_cid) =
+                                                            Cid::try_from(address.tree_cid.as_slice())
+                                                        else {
+                                                            continue;
+                                                        };
+                                                        let index = address.index;
+
+                                                        match want_type {
+                                                            WantType::WantHave => {
+                                                                let have = has_leaf_block(
+                                                                    block_store.as_ref(),
+                                                                    &tree_cid,
+                                                                    index,
+                                                                )
+                                                                .await;
+                                                                if have {
+                                                                    response_presences.push(
+                                                                        BlockPresence {
+                                                                            address: Some(
+                                                                                address.clone(),
+                                                                            ),
+                                                                            r#type:
+                                                                                BlockPresenceType::PresenceHave
+                                                                                    as i32,
+                                                                            price: vec![0],
+                                                                        },
+                                                                    );
+                                                                } else if entry.send_dont_have {
+                                                                    response_presences.push(
+                                                                        BlockPresence {
+                                                                            address: Some(
+                                                                                address.clone(),
+                                                                            ),
+                                                                            r#type:
+                                                                                BlockPresenceType::PresenceDontHave
+                                                                                    as i32,
+                                                                            price: vec![0],
+                                                                        },
+                                                                    );
+                                                                }
                                                             }
-                                                        } else {
-                                                            debug!(
-                                                                "BlockExc: Failed to parse CID from {} bytes",
-                                                                cid_bytes.len()
-                                                            );
+                                                            WantType::WantBlock => {
+                                                                if let Some(delivery) = resolve_leaf_delivery(
+                                                                    block_store.as_ref(),
+                                                                    &tree_cid,
+                                                                    index,
+                                                                )
+                                                                .await
+                                                                {
+                                                                    metrics.block_sent(
+                                                                        delivery.data.len(),
+                                                                    );
+                                                                    response_blocks.push(delivery);
+                                                                }
+                                                            }
                                                         }
                                                     } else {
-                                                        debug!(
-                                                            "BlockExc: Wantlist entry missing CID bytes"
-                                                        );
+                                                        let Ok(cid) =
+                                                            Cid::try_from(address.cid.as_slice())
+                                                        else {
+                                                            continue;
+                                                        };
+
+                                                        let block = block_store.get(&cid).await.ok();
+                                                        match want_type {
+                                                            WantType::WantHave => {
+                                                                let have = block.is_some();
+                                                                if have {
+                                                                    response_presences.push(
+                                                                        BlockPresence {
+                                                                            address: Some(
+                                                                                address.clone(),
+                                                                            ),
+                                                                            r#type:
+                                                                                BlockPresenceType::PresenceHave
+                                                                                    as i32,
+                                                                            price: vec![0],
+                                                                        },
+                                                                    );
+                                                                } else if entry.send_dont_have {
+                                                                    response_presences.push(
+                                                                        BlockPresence {
+                                                                            address: Some(
+                                                                                address.clone(),
+                                                                            ),
+                                                                            r#type:
+                                                                                BlockPresenceType::PresenceDontHave
+                                                                                    as i32,
+                                                                            price: vec![0],
+                                                                        },
+                                                                    );
+                                                                }
+                                                            }
+                                                            WantType::WantBlock => {
+                                                                if let Some(block) = block {
+                                                                    metrics.block_sent(
+                                                                        block.data.len(),
+                                                                    );
+                                                                    response_blocks.push(
+                                                                        BlockDelivery::from_cid_and_data(
+                                                                            cid.to_bytes(),
+                                                                            block.data,
+                                                                        ),
+                                                                    );
+                                                                }
+                                                            }
+                                                        }
                                                     }
                                                 }
 
-                                                let response = Message {
-                                                    wantlist: None,
-                                                    payload: response_blocks,
-                                                    block_presences: vec![],
-                                                    pending_bytes: 0,
-                                                    account: None,
-                                                    payment: None,
-                                                };
-
-                                                if let Ok(response_bytes) =
-                                                    encode_message(&response)
+                                                if !response_blocks.is_empty()
+                                                    || !response_presences.is_empty()
                                                 {
-                                                    if let Err(e) = write_length_prefixed(
-                                                        &mut stream,
-                                                        &response_bytes,
-                                                    )
-                                                    .await
+                                                    let response = Message {
+                                                        wantlist: None,
+                                                        payload: response_blocks,
+                                                        block_presences: response_presences,
+                                                        pending_bytes: 0,
+                                                        account: None,
+                                                        payment: None,
+                                                    };
+
+                                                    if let Ok(response_bytes) =
+                                                        encode_message(&response)
                                                     {
-                                                        warn!("BlockExc: Failed to send response to {}: {}", peer_id, e);
-                                                        break;
+                                                        if let Err(e) = write_length_prefixed(
+                                                            &mut stream,
+                                                            &response_bytes,
+                                                        )
+                                                        .await
+                                                        {
+                                                            warn!("BlockExc: Failed to send response to {}: {}", peer_id, e);
+                                                            break;
+                                                        }
                                                     }
                                                 }
                                             } else if mode == "marketplace" {
@@ -469,6 +632,7 @@ impl ConnectionHandler for BlockExcHandler {
                     use crate::messages::{
                         decode_message, encode_message, Message, WantType, Wantlist, WantlistEntry,
                     };
+                    use crate::cid_blake3::verify_blake3;
                     use crate::storage::Block;
 
                     let mut stream = stream;
@@ -541,35 +705,38 @@ impl ConnectionHandler for BlockExcHandler {
                                                 msg_block.data.len()
                                             );
 
-                                            // Compute CID from data and verify it matches what we requested
-                                            use crate::cid_blake3::blake3_cid;
-                                            match blake3_cid(&msg_block.data) {
-                                                Ok(computed_cid) => {
-                                                    if computed_cid != requested_cid {
-                                                        warn!("BlockExc: CID mismatch! Expected {}, got {}", requested_cid, computed_cid);
-                                                        continue;
-                                                    }
+                                            if let Err(e) = verify_blake3(&msg_block.data, &requested_cid)
+                                            {
+                                                warn!(
+                                                    "BlockExc: CID verification failed for requested {}: {}",
+                                                    requested_cid, e
+                                                );
+                                                continue;
+                                            }
 
-                                                    // Create Block and store it
-                                                    let block = Block {
-                                                        cid: computed_cid,
-                                                        data: msg_block.data.clone(),
-                                                    };
+                                            let block = match Block::from_cid_and_data(
+                                                requested_cid,
+                                                msg_block.data.clone(),
+                                            ) {
+                                                Ok(b) => b,
+                                                Err(e) => {
+                                                    warn!(
+                                                        "BlockExc: Failed to create block for {}: {}",
+                                                        requested_cid, e
+                                                    );
+                                                    continue;
+                                                }
+                                            };
 
-                                                    let block_size = msg_block.data.len();
-                                                    match block_store.put(block).await {
-                                                        Ok(_) => {
-                                                            info!("BlockExc: Stored block {} from {} - {} bytes", computed_cid, peer_id, block_size);
-                                                            metrics.block_received(block_size);
-                                                            // Track P2P traffic!
-                                                        }
-                                                        Err(e) => {
-                                                            warn!("BlockExc: Failed to store block: {}", e);
-                                                        }
-                                                    }
+                                            let block_size = msg_block.data.len();
+                                            match block_store.put(block).await {
+                                                Ok(_) => {
+                                                    info!("BlockExc: Stored block {} from {} - {} bytes", requested_cid, peer_id, block_size);
+                                                    metrics.block_received(block_size);
+                                                    // Track P2P traffic!
                                                 }
                                                 Err(e) => {
-                                                    warn!("BlockExc: Failed to compute CID for received block: {}", e);
+                                                    warn!("BlockExc: Failed to store block: {}", e);
                                                 }
                                             }
                                         }

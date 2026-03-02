@@ -253,3 +253,89 @@ async fn local_download_does_not_fetch_missing_blocks_from_network() {
         .expect("local get response");
     assert_eq!(local_get_resp.status(), StatusCode::NOT_FOUND);
 }
+
+#[tokio::test]
+async fn ipfs_cluster_style_pin_endpoints_accept_neverust_tags() {
+    let (app, _) = test_app();
+    let payload = b"cluster-compat-payload".to_vec();
+
+    let upload = Request::builder()
+        .method("POST")
+        .uri("/api/archivist/v1/data")
+        .header("content-type", "application/octet-stream")
+        .body(Body::from(payload))
+        .expect("valid upload request");
+    let upload_resp = app.clone().oneshot(upload).await.expect("upload response");
+    assert_eq!(upload_resp.status(), StatusCode::OK);
+    let cid = String::from_utf8(
+        to_bytes(upload_resp.into_body(), usize::MAX)
+            .await
+            .expect("upload body")
+            .to_vec(),
+    )
+    .expect("cid")
+    .trim()
+    .to_string();
+
+    let pin_req = serde_json::json!({
+        "name": "compat-pin",
+        "replication_factor_min": 1,
+        "replication_factor_max": 3,
+        "metadata": {"app": "legacy-ipfs-integration"},
+        "neverust_tags": {"tenant": "alpha", "tier": "hot"}
+    });
+    let pin = Request::builder()
+        .method("POST")
+        .uri(format!("/api/ipfs-cluster/v1/pins/{}", cid))
+        .header("content-type", "application/json")
+        .body(Body::from(pin_req.to_string()))
+        .expect("valid pin request");
+    let pin_resp = app.clone().oneshot(pin).await.expect("pin response");
+    assert_eq!(pin_resp.status(), StatusCode::OK);
+    let pin_json: serde_json::Value = serde_json::from_slice(
+        &to_bytes(pin_resp.into_body(), usize::MAX)
+            .await
+            .expect("pin body"),
+    )
+    .expect("pin json");
+    assert_eq!(pin_json["cid"], cid);
+    assert_eq!(pin_json["neverust_tags"]["tenant"], "alpha");
+    assert_eq!(pin_json["metadata"]["app"], "legacy-ipfs-integration");
+
+    let list = Request::builder()
+        .uri("/api/ipfs-cluster/v1/pins")
+        .body(Body::empty())
+        .expect("valid list request");
+    let list_resp = app.clone().oneshot(list).await.expect("list response");
+    assert_eq!(list_resp.status(), StatusCode::OK);
+    let list_json: serde_json::Value = serde_json::from_slice(
+        &to_bytes(list_resp.into_body(), usize::MAX)
+            .await
+            .expect("list body"),
+    )
+    .expect("list json");
+    assert!(list_json
+        .as_array()
+        .expect("array")
+        .iter()
+        .any(|item| item["cid"] == cid));
+
+    let get_pin = Request::builder()
+        .uri(format!("/api/ipfs-cluster/v1/pins/{}", cid))
+        .body(Body::empty())
+        .expect("valid get pin request");
+    let get_pin_resp = app
+        .clone()
+        .oneshot(get_pin)
+        .await
+        .expect("get pin response");
+    assert_eq!(get_pin_resp.status(), StatusCode::OK);
+
+    let unpin = Request::builder()
+        .method("DELETE")
+        .uri(format!("/api/ipfs-cluster/v1/pins/{}", cid))
+        .body(Body::empty())
+        .expect("valid unpin request");
+    let unpin_resp = app.clone().oneshot(unpin).await.expect("unpin response");
+    assert_eq!(unpin_resp.status(), StatusCode::ACCEPTED);
+}

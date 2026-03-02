@@ -9,7 +9,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{debug, info};
 
-use crate::cid_blake3::{blake3_cid, verify_blake3, CidError};
+use crate::cid_blake3::{blake3_cid, sha256_cid, verify_blake3, CidError};
 
 #[derive(Debug, thiserror::Error)]
 pub enum StorageError {
@@ -34,6 +34,12 @@ impl Block {
     /// Create a new block from data, computing its CID
     pub fn new(data: Vec<u8>) -> Result<Self, CidError> {
         let cid = blake3_cid(&data)?;
+        Ok(Self { cid, data })
+    }
+
+    /// Create an Archivist-compatible SHA2-256 block.
+    pub fn new_sha256(data: Vec<u8>) -> Result<Self, CidError> {
+        let cid = sha256_cid(&data)?;
         Ok(Self { cid, data })
     }
 

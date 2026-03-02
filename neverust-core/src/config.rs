@@ -4,6 +4,7 @@
 
 use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::path::PathBuf;
 use thiserror::Error;
 
@@ -67,6 +68,50 @@ pub struct StartCommand {
     /// Bootstrap node multiaddr (can be specified multiple times)
     #[arg(long)]
     pub bootstrap_node: Vec<String>,
+
+    /// Enable Citadel/Lens mode inside Neverust.
+    #[arg(long)]
+    pub citadel_mode: bool,
+
+    /// Local Lens Site ID used by Citadel mode.
+    #[arg(long, default_value_t = 1)]
+    pub citadel_site_id: u64,
+
+    /// Optional explicit Citadel origin/node ID. If 0, derived from peer ID.
+    #[arg(long, default_value_t = 0)]
+    pub citadel_node_id: u32,
+
+    /// Optional host/domain bucket ID for Citadel admission guards.
+    #[arg(long)]
+    pub citadel_host_id: Option<u8>,
+
+    /// Optional Flagship trust snapshot URL (JSON).
+    #[arg(long)]
+    pub citadel_flagship_url: Option<String>,
+
+    /// Trusted origin IDs (can be specified multiple times).
+    #[arg(long)]
+    pub citadel_trusted_origin: Vec<u32>,
+
+    /// Idle control-plane bandwidth cap in KiB/s (per node).
+    #[arg(long, default_value_t = 100)]
+    pub citadel_idle_bandwidth_kib: u64,
+
+    /// Base PoW bits required for unknown origins.
+    #[arg(long, default_value_t = 8)]
+    pub citadel_pow_bits: u8,
+
+    /// Reduced PoW bits required for trusted origins.
+    #[arg(long, default_value_t = 4)]
+    pub citadel_trusted_pow_bits: u8,
+
+    /// Per-origin op rate cap per simulation/runtime round.
+    #[arg(long, default_value_t = 96)]
+    pub citadel_max_ops_per_origin_per_round: u32,
+
+    /// Max new origins admitted per host per round.
+    #[arg(long, default_value_t = 12)]
+    pub citadel_max_new_origins_per_host_per_round: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -80,6 +125,52 @@ pub struct Config {
     pub bootstrap_nodes: Vec<String>,
     pub mode: String,
     pub price_per_byte: u64,
+    #[serde(default)]
+    pub citadel_mode: bool,
+    #[serde(default = "default_citadel_site_id")]
+    pub citadel_site_id: u64,
+    #[serde(default)]
+    pub citadel_node_id: u32,
+    #[serde(default)]
+    pub citadel_host_id: Option<u8>,
+    #[serde(default)]
+    pub citadel_flagship_url: Option<String>,
+    #[serde(default)]
+    pub citadel_trusted_origins: Vec<u32>,
+    #[serde(default = "default_citadel_idle_bandwidth_kib")]
+    pub citadel_idle_bandwidth_kib: u64,
+    #[serde(default = "default_citadel_pow_bits")]
+    pub citadel_pow_bits: u8,
+    #[serde(default = "default_citadel_trusted_pow_bits")]
+    pub citadel_trusted_pow_bits: u8,
+    #[serde(default = "default_citadel_max_ops_per_origin_per_round")]
+    pub citadel_max_ops_per_origin_per_round: u32,
+    #[serde(default = "default_citadel_max_new_origins_per_host_per_round")]
+    pub citadel_max_new_origins_per_host_per_round: u32,
+}
+
+fn default_citadel_site_id() -> u64 {
+    1
+}
+
+fn default_citadel_idle_bandwidth_kib() -> u64 {
+    100
+}
+
+fn default_citadel_pow_bits() -> u8 {
+    8
+}
+
+fn default_citadel_trusted_pow_bits() -> u8 {
+    4
+}
+
+fn default_citadel_max_ops_per_origin_per_round() -> u32 {
+    96
+}
+
+fn default_citadel_max_new_origins_per_host_per_round() -> u32 {
+    12
 }
 
 impl Default for Config {
@@ -93,6 +184,17 @@ impl Default for Config {
             bootstrap_nodes: Vec::new(),
             mode: "altruistic".to_string(),
             price_per_byte: 1,
+            citadel_mode: false,
+            citadel_site_id: 1,
+            citadel_node_id: 0,
+            citadel_host_id: None,
+            citadel_flagship_url: None,
+            citadel_trusted_origins: Vec::new(),
+            citadel_idle_bandwidth_kib: 100,
+            citadel_pow_bits: 8,
+            citadel_trusted_pow_bits: 4,
+            citadel_max_ops_per_origin_per_round: 96,
+            citadel_max_new_origins_per_host_per_round: 12,
         }
     }
 }
@@ -128,48 +230,107 @@ impl Config {
             );
 
             // Parse the bootstrap node address (format: "host:port" or "ip:port")
-            // We need to fetch the peer ID from the node's API
-            let url = format!("http://{}/api/archivist/v1/peer-id", bootstrap_node);
+            // and fetch peer ID from the node's API.
+            // Real Archivist exposes `/peerid`, while Neverust exposes both.
+            let candidate_urls = [
+                format!("http://{}/api/archivist/v1/peer-id", bootstrap_node),
+                format!("http://{}/api/archivist/v1/peerid", bootstrap_node),
+            ];
 
-            match reqwest::get(&url).await {
-                Ok(response) => {
-                    if let Ok(peer_id) = response.text().await {
-                        let peer_id = peer_id.trim().trim_matches('"');
-                        // Extract host and port
-                        let parts: Vec<&str> = bootstrap_node.split(':').collect();
-                        if parts.len() == 2 {
-                            let host = parts[0];
-                            // Resolve hostname to IP if needed
-                            let resolved_host = if host.parse::<std::net::IpAddr>().is_ok() {
-                                host.to_string()
-                            } else {
-                                // Try to resolve hostname to IP
-                                match tokio::net::lookup_host(format!("{}:0", host)).await {
-                                    Ok(mut addrs) => {
-                                        if let Some(addr) = addrs.next() {
-                                            addr.ip().to_string()
-                                        } else {
-                                            host.to_string()
-                                        }
+            let mut resolved_peer_id: Option<String> = None;
+            for url in candidate_urls {
+                match reqwest::get(&url).await {
+                    Ok(response) => {
+                        if !response.status().is_success() {
+                            tracing::debug!(
+                                "Bootstrap peer ID endpoint returned non-success status: {} {}",
+                                url,
+                                response.status()
+                            );
+                            continue;
+                        }
+
+                        match response.text().await {
+                            Ok(body) => {
+                                let body = body.trim();
+                                let peer_id = if body.starts_with('{') {
+                                    serde_json::from_str::<Value>(body)
+                                        .ok()
+                                        .and_then(|v| {
+                                            v.get("id")
+                                                .and_then(|id| id.as_str())
+                                                .map(|id| id.to_string())
+                                        })
+                                } else {
+                                    Some(body.trim_matches('"').to_string())
+                                };
+
+                                if let Some(peer_id) = peer_id {
+                                    if !peer_id.is_empty() {
+                                        resolved_peer_id = Some(peer_id);
+                                        break;
                                     }
-                                    Err(_) => host.to_string(),
                                 }
-                            };
-                            // Use port 8070 for P2P (not the API port)
-                            let multiaddr =
-                                format!("/ip4/{}/tcp/8070/p2p/{}", resolved_host, peer_id);
-                            tracing::info!("Resolved local bootstrap multiaddr: {}", multiaddr);
-                            return Ok(vec![multiaddr]);
+                            }
+                            Err(e) => {
+                                tracing::debug!(
+                                    "Failed reading bootstrap peer ID response body from {}: {}",
+                                    url,
+                                    e
+                                );
+                            }
                         }
                     }
+                    Err(e) => {
+                        tracing::debug!("Failed to query bootstrap peer ID URL {}: {}", url, e);
+                    }
                 }
-                Err(e) => {
-                    tracing::warn!(
-                        "Failed to fetch peer ID from bootstrap node {}: {}",
-                        bootstrap_node,
-                        e
-                    );
+            }
+
+            if let Some(peer_id) = resolved_peer_id {
+                // Extract host and port
+                if let Some((host, api_port_str)) = bootstrap_node.rsplit_once(':') {
+                    let host = host.trim_matches(['[', ']']);
+                    let api_port = api_port_str.parse::<u16>().ok();
+                    let p2p_port = std::env::var("BOOTSTRAP_P2P_PORT")
+                        .ok()
+                        .and_then(|v| v.parse::<u16>().ok())
+                        .or_else(|| {
+                            api_port.and_then(|port| {
+                                if port > 10 {
+                                    Some(port - 10)
+                                } else {
+                                    None
+                                }
+                            })
+                        })
+                        .unwrap_or(8070);
+                    // Resolve hostname to IP if needed
+                    let resolved_host = if host.parse::<std::net::IpAddr>().is_ok() {
+                        host.to_string()
+                    } else {
+                        // Try to resolve hostname to IP
+                        match tokio::net::lookup_host(format!("{}:0", host)).await {
+                            Ok(mut addrs) => {
+                                if let Some(addr) = addrs.next() {
+                                    addr.ip().to_string()
+                                } else {
+                                    host.to_string()
+                                }
+                            }
+                            Err(_) => host.to_string(),
+                        }
+                    };
+                    let multiaddr =
+                        format!("/ip4/{}/tcp/{}/p2p/{}", resolved_host, p2p_port, peer_id);
+                    tracing::info!("Resolved local bootstrap multiaddr: {}", multiaddr);
+                    return Ok(vec![multiaddr]);
                 }
+            } else {
+                tracing::warn!(
+                    "Failed to fetch peer ID from bootstrap node {}; falling back to testnet",
+                    bootstrap_node
+                );
             }
         }
 
@@ -253,6 +414,18 @@ impl From<StartCommand> for Config {
             bootstrap_nodes: cmd.bootstrap_node,
             mode: cmd.mode,
             price_per_byte: cmd.price_per_byte,
+            citadel_mode: cmd.citadel_mode,
+            citadel_site_id: cmd.citadel_site_id,
+            citadel_node_id: cmd.citadel_node_id,
+            citadel_host_id: cmd.citadel_host_id,
+            citadel_flagship_url: cmd.citadel_flagship_url,
+            citadel_trusted_origins: cmd.citadel_trusted_origin,
+            citadel_idle_bandwidth_kib: cmd.citadel_idle_bandwidth_kib,
+            citadel_pow_bits: cmd.citadel_pow_bits,
+            citadel_trusted_pow_bits: cmd.citadel_trusted_pow_bits,
+            citadel_max_ops_per_origin_per_round: cmd.citadel_max_ops_per_origin_per_round,
+            citadel_max_new_origins_per_host_per_round: cmd
+                .citadel_max_new_origins_per_host_per_round,
         }
     }
 }
@@ -268,6 +441,8 @@ mod tests {
         assert_eq!(config.listen_port, 8070);
         assert_eq!(config.disc_port, 8090);
         assert_eq!(config.log_level, "info");
+        assert!(!config.citadel_mode);
+        assert_eq!(config.citadel_idle_bandwidth_kib, 100);
     }
 
     #[test]
@@ -281,6 +456,17 @@ mod tests {
             price_per_byte: 100,
             log_level: "debug".to_string(),
             bootstrap_node: vec!["/ip4/1.2.3.4/tcp/8070/p2p/12D3KooTest".to_string()],
+            citadel_mode: true,
+            citadel_site_id: 42,
+            citadel_node_id: 7,
+            citadel_host_id: Some(2),
+            citadel_flagship_url: Some("http://127.0.0.1:9999/trust".to_string()),
+            citadel_trusted_origin: vec![1, 2, 3],
+            citadel_idle_bandwidth_kib: 64,
+            citadel_pow_bits: 9,
+            citadel_trusted_pow_bits: 5,
+            citadel_max_ops_per_origin_per_round: 32,
+            citadel_max_new_origins_per_host_per_round: 6,
         };
 
         let config: Config = cmd.into();
@@ -292,5 +478,11 @@ mod tests {
         assert_eq!(config.price_per_byte, 100);
         assert_eq!(config.log_level, "debug");
         assert_eq!(config.bootstrap_nodes.len(), 1);
+        assert!(config.citadel_mode);
+        assert_eq!(config.citadel_site_id, 42);
+        assert_eq!(config.citadel_node_id, 7);
+        assert_eq!(config.citadel_host_id, Some(2));
+        assert_eq!(config.citadel_trusted_origins, vec![1, 2, 3]);
+        assert_eq!(config.citadel_idle_bandwidth_kib, 64);
     }
 }

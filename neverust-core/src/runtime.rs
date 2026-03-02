@@ -7,6 +7,8 @@ use crate::{
     api,
     blockexc::BlockExcClient,
     botg::{BoTgConfig, BoTgProtocol},
+    citadel::{fetch_flagship_trust_snapshot, DefederationGuardConfig, DefederationNode},
+    citadel_sync::{configured_citadel_mesh_sync, spawn_citadel_mesh_sync},
     config::Config,
     discovery::Discovery,
     metrics::Metrics,
@@ -18,7 +20,22 @@ use futures::StreamExt;
 use libp2p::{swarm::SwarmEvent, Multiaddr};
 use std::sync::Arc;
 use tokio::signal;
+use tokio::sync::RwLock as AsyncRwLock;
 use tracing::{error, info, warn};
+
+fn derive_citadel_host_id(config: &Config) -> u8 {
+    if let Some(host_id) = config.citadel_host_id {
+        return host_id;
+    }
+    if let Some(host_id) = std::env::var("NEVERUST_CITADEL_HOST_ID")
+        .ok()
+        .and_then(|v| v.parse::<u8>().ok())
+    {
+        return host_id;
+    }
+    let host_name = std::env::var("HOSTNAME").unwrap_or_else(|_| "unknown-host".to_string());
+    blake3::hash(host_name.as_bytes()).as_bytes()[0]
+}
 
 /// Run the Archivist node with the given configuration
 pub async fn run_node(config: Config) -> Result<(), P2PError> {
@@ -43,6 +60,91 @@ pub async fn run_node(config: Config) -> Result<(), P2PError> {
     )
     .await?;
     let peer_id = swarm.local_peer_id().to_string();
+
+    // Optional Citadel/Lens mode for defederation modeling and local control-plane APIs.
+    let citadel_node: Option<Arc<AsyncRwLock<DefederationNode>>> = if config.citadel_mode {
+        let mut trusted = std::collections::HashSet::new();
+        for origin in &config.citadel_trusted_origins {
+            trusted.insert(*origin);
+        }
+        let guard = DefederationGuardConfig {
+            base_pow_bits: config.citadel_pow_bits,
+            trusted_pow_bits: config.citadel_trusted_pow_bits,
+            max_ops_per_origin_per_round: config.citadel_max_ops_per_origin_per_round,
+            max_new_origins_per_host_per_round: config
+                .citadel_max_new_origins_per_host_per_round,
+            max_pending_per_origin: 512,
+        };
+        let node_id = if config.citadel_node_id == 0 {
+            let digest = blake3::hash(peer_id.as_bytes());
+            let bytes = digest.as_bytes();
+            u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+        } else {
+            config.citadel_node_id
+        };
+        let host_id = derive_citadel_host_id(&config);
+        let mut node =
+            DefederationNode::new(node_id, host_id, config.citadel_site_id, trusted, guard);
+        node.set_idle_bandwidth_bytes_per_sec(
+            config.citadel_idle_bandwidth_kib.saturating_mul(1024),
+        );
+        if let Some(ref url) = config.citadel_flagship_url {
+            match fetch_flagship_trust_snapshot(url).await {
+                Ok(snapshot) => {
+                    for origin in snapshot.trusted_origins {
+                        node.trust_origin(origin, true);
+                    }
+                    for site in snapshot.bootstrap_sites {
+                        node.emit_local_follow(site, true);
+                    }
+                    info!("Citadel: loaded initial flagship trust snapshot from {}", url);
+                }
+                Err(e) => {
+                    warn!("Citadel: failed to load flagship trust snapshot {}: {}", url, e);
+                }
+            }
+        }
+        info!(
+            "Citadel mode enabled: node_id={}, host_id={}, site_id={}, idle_cap={}KiB/s",
+            node_id, host_id, config.citadel_site_id, config.citadel_idle_bandwidth_kib
+        );
+        Some(Arc::new(AsyncRwLock::new(node)))
+    } else {
+        None
+    };
+
+    if let (Some(citadel), Some(flagship_url)) =
+        (citadel_node.clone(), config.citadel_flagship_url.clone())
+    {
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(120));
+            loop {
+                tick.tick().await;
+                match fetch_flagship_trust_snapshot(&flagship_url).await {
+                    Ok(snapshot) => {
+                        let mut node = citadel.write().await;
+                        for origin in snapshot.trusted_origins {
+                            node.trust_origin(origin, true);
+                        }
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Citadel: periodic flagship refresh failed ({}): {}",
+                            flagship_url, e
+                        );
+                    }
+                }
+            }
+        });
+    }
+
+    if let Some(citadel) = citadel_node.clone() {
+        if let Some(sync_cfg) = configured_citadel_mesh_sync(config.api_port) {
+            spawn_citadel_mesh_sync(citadel, sync_cfg);
+        } else {
+            info!("Citadel sync peers not configured; running local-only Citadel state");
+        }
+    }
 
     // Initialize BlockExc client for requesting blocks from peers (via channel to swarm)
     let _blockexc_client = Arc::new(BlockExcClient::new(
@@ -173,14 +275,16 @@ pub async fn run_node(config: Config) -> Result<(), P2PError> {
     let api_keypair = Arc::new(keypair);
     let api_listen_addrs = listen_addrs.clone();
     let api_port = config.api_port;
+    let api_citadel = citadel_node.clone();
     tokio::spawn(async move {
-        let app = api::create_router(
+        let app = api::create_router_with_citadel(
             api_block_store,
             api_metrics,
             api_peer_id,
             api_botg,
             api_keypair,
             api_listen_addrs,
+            api_citadel,
         );
         let addr = format!("0.0.0.0:{}", api_port);
         info!("Starting REST API on {}", addr);

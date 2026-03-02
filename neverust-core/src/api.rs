@@ -12,33 +12,237 @@ use base64::Engine;
 use cid::{multibase::Base, Cid};
 use rand::seq::SliceRandom;
 use serde::{Deserialize, Serialize};
+use serde_json::json;
+use std::collections::HashMap;
 use std::sync::Arc;
 use tower_http::trace::TraceLayer;
 use tracing::{error, info};
 
 use crate::archivist_tree::ArchivistTree;
 use crate::botg::BoTgProtocol;
-use crate::chunker::DEFAULT_BLOCK_SIZE;
-use crate::manifest::{Manifest, BLAKE3_CODEC};
+use crate::citadel::{
+    run_defederation_simulation, CitadelSyncPullRequest, CitadelSyncPullResponse,
+    CitadelSyncPushRequest, CitadelSyncPushResponse, DefederationNode,
+    DefederationSimulationConfig,
+};
+use crate::manifest::{Manifest, SHA256_CODEC};
 use crate::metrics::Metrics;
 use crate::storage::{Block, BlockStore, StorageError};
 use libp2p::{identity::Keypair, Multiaddr};
 use std::sync::RwLock;
+use tokio::sync::RwLock as AsyncRwLock;
 
 fn upload_block_size() -> usize {
     std::env::var("NEVERUST_UPLOAD_BLOCK_SIZE")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|&v| v > 0)
-        .unwrap_or(DEFAULT_BLOCK_SIZE)
+        .unwrap_or(1024 * 1024)
 }
 
-fn upload_commit_batch_blocks() -> usize {
+fn upload_commit_batch_blocks(block_size: usize) -> usize {
+    let target_commit_bytes = std::env::var("NEVERUST_UPLOAD_COMMIT_BATCH_BYTES")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(256 * 1024 * 1024);
+
     std::env::var("NEVERUST_UPLOAD_COMMIT_BATCH_BLOCKS")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|&v| v > 0)
-        .unwrap_or(256)
+        .unwrap_or_else(|| (target_commit_bytes / block_size).max(1))
+}
+
+fn upload_dedupe_blocks() -> bool {
+    std::env::var("NEVERUST_UPLOAD_DEDUPE_BLOCKS")
+        .ok()
+        .map(|v| {
+            let s = v.trim().to_ascii_lowercase();
+            !(s == "0" || s == "false" || s == "no" || s == "off")
+        })
+        .unwrap_or(true)
+}
+
+fn upload_hash_workers() -> usize {
+    std::env::var("NEVERUST_UPLOAD_HASH_WORKERS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1)
+                .clamp(1, 32)
+        })
+}
+
+fn upload_inflight_batches() -> usize {
+    std::env::var("NEVERUST_UPLOAD_INFLIGHT_BATCHES")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(4)
+        .clamp(1, 16)
+}
+
+fn configured_http_fallback_peers() -> Vec<String> {
+    std::env::var("NEVERUST_HTTP_FALLBACK_PEERS")
+        .ok()
+        .map(|raw| {
+            raw.split(',')
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(ToOwned::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+}
+
+fn default_http_fallback_peers() -> Vec<String> {
+    let mut peer_urls = vec!["http://bootstrap:8080".to_string()];
+
+    // Docker network peers
+    for i in 1..50 {
+        peer_urls.push(format!("http://node{}:8080", i));
+    }
+
+    // Known external peers and common Archivist API ports
+    let external_peers = vec![
+        "91.98.135.54",
+        "10.7.1.200", // blackberry
+    ];
+    for peer in external_peers {
+        for port in [8080, 8070, 8000, 3000] {
+            peer_urls.push(format!("http://{}:{}", peer, port));
+        }
+    }
+
+    peer_urls
+}
+
+fn fallback_http_peer_urls() -> Vec<String> {
+    let configured = configured_http_fallback_peers();
+    if !configured.is_empty() {
+        return configured;
+    }
+    default_http_fallback_peers()
+}
+
+fn hash_raw_blocks_parallel(
+    raw_blocks: Vec<Vec<u8>>,
+    workers: usize,
+) -> Result<Vec<Block>, String> {
+    let total = raw_blocks.len();
+    if total == 0 {
+        return Ok(Vec::new());
+    }
+
+    let worker_count = workers.max(1).min(total);
+    if worker_count == 1 {
+        return raw_blocks
+            .into_iter()
+            .map(|data| Block::new_sha256(data).map_err(|e| e.to_string()))
+            .collect();
+    }
+
+    let mut lanes: Vec<Vec<(usize, Vec<u8>)>> = (0..worker_count).map(|_| Vec::new()).collect();
+    for (idx, data) in raw_blocks.into_iter().enumerate() {
+        lanes[idx % worker_count].push((idx, data));
+    }
+
+    let mut handles = Vec::with_capacity(worker_count);
+    for lane in lanes {
+        handles.push(std::thread::spawn(
+            move || -> Result<Vec<(usize, Block)>, String> {
+                let mut out = Vec::with_capacity(lane.len());
+                for (idx, data) in lane {
+                    let block = Block::new_sha256(data).map_err(|e| e.to_string())?;
+                    out.push((idx, block));
+                }
+                Ok(out)
+            },
+        ));
+    }
+
+    let mut ordered: Vec<Option<Block>> = vec![None; total];
+    for handle in handles {
+        let lane = handle
+            .join()
+            .map_err(|_| "Upload hash worker panicked".to_string())??;
+        for (idx, block) in lane {
+            ordered[idx] = Some(block);
+        }
+    }
+
+    ordered
+        .into_iter()
+        .map(|maybe| maybe.ok_or_else(|| "Missing hashed block result".to_string()))
+        .collect()
+}
+
+async fn flush_upload_raw_batch(
+    state: &ApiState,
+    raw_batch: &mut Vec<Vec<u8>>,
+    seen_cids: &mut Option<std::collections::HashSet<Cid>>,
+    block_cids: &mut Vec<Cid>,
+) -> Result<(), ApiError> {
+    if raw_batch.is_empty() {
+        return Ok(());
+    }
+
+    let workers = upload_hash_workers();
+    let batch = std::mem::take(raw_batch);
+    let blocks = tokio::task::spawn_blocking(move || hash_raw_blocks_parallel(batch, workers))
+        .await
+        .map_err(|e| ApiError::Internal(format!("Failed to hash upload batch: {}", e)))?
+        .map_err(|e| ApiError::Internal(format!("Failed to hash upload batch: {}", e)))?;
+
+    let mut to_store = Vec::with_capacity(blocks.len());
+    for block in blocks {
+        let cid = block.cid;
+        block_cids.push(cid);
+        let should_store = if let Some(seen) = seen_cids.as_mut() {
+            seen.insert(cid)
+        } else {
+            true
+        };
+        if should_store {
+            to_store.push(block);
+        }
+    }
+
+    if !to_store.is_empty() {
+        state
+            .block_store
+            .put_many(to_store)
+            .await
+            .map_err(|e| ApiError::Internal(format!("Failed to store block batch: {}", e)))?;
+    }
+
+    Ok(())
+}
+
+async fn process_upload_raw_batch_no_dedupe(
+    block_store: Arc<BlockStore>,
+    raw_batch: Vec<Vec<u8>>,
+) -> Result<Vec<Cid>, ApiError> {
+    if raw_batch.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let workers = upload_hash_workers();
+    let blocks = tokio::task::spawn_blocking(move || hash_raw_blocks_parallel(raw_batch, workers))
+        .await
+        .map_err(|e| ApiError::Internal(format!("Failed to hash upload batch: {}", e)))?
+        .map_err(|e| ApiError::Internal(format!("Failed to hash upload batch: {}", e)))?;
+
+    let cids: Vec<Cid> = blocks.iter().map(|b| b.cid).collect();
+    block_store
+        .put_many(blocks)
+        .await
+        .map_err(|e| ApiError::Internal(format!("Failed to store block batch: {}", e)))?;
+    Ok(cids)
 }
 
 /// Convert CID to base58btc string (Archivist format with 'z' prefix)
@@ -56,6 +260,10 @@ pub struct ApiState {
     pub botg: Arc<BoTgProtocol>,
     pub keypair: Arc<Keypair>,
     pub listen_addrs: Arc<RwLock<Vec<Multiaddr>>>,
+    pub fallback_http_peers: Arc<Vec<String>>,
+    pub fallback_http_client: reqwest::Client,
+    pub ipfs_cluster_pins: Arc<AsyncRwLock<HashMap<String, IpfsClusterPinRecord>>>,
+    pub citadel_node: Option<Arc<AsyncRwLock<DefederationNode>>>,
 }
 
 /// Response for storing a block
@@ -123,6 +331,57 @@ pub struct ErrorResponse {
     pub error: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct IpfsClusterPinRequest {
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub mode: Option<String>,
+    #[serde(default)]
+    pub replication_factor_min: Option<i32>,
+    #[serde(default)]
+    pub replication_factor_max: Option<i32>,
+    #[serde(default)]
+    pub user_allocations: Vec<String>,
+    #[serde(default)]
+    pub metadata: HashMap<String, String>,
+    /// Neverust extension tags (optional, backwards compatible).
+    #[serde(default)]
+    pub neverust_tags: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IpfsClusterPinRecord {
+    pub cid: String,
+    pub name: Option<String>,
+    pub mode: String,
+    pub replication_factor_min: i32,
+    pub replication_factor_max: i32,
+    pub user_allocations: Vec<String>,
+    pub metadata: HashMap<String, String>,
+    #[serde(default)]
+    pub neverust_tags: HashMap<String, String>,
+    pub status: String,
+    pub error: Option<String>,
+}
+
+impl IpfsClusterPinRecord {
+    fn from_request(cid: String, req: IpfsClusterPinRequest) -> Self {
+        Self {
+            cid,
+            name: req.name,
+            mode: req.mode.unwrap_or_else(|| "recursive".to_string()),
+            replication_factor_min: req.replication_factor_min.unwrap_or(-1),
+            replication_factor_max: req.replication_factor_max.unwrap_or(-1),
+            user_allocations: req.user_allocations,
+            metadata: req.metadata,
+            neverust_tags: req.neverust_tags,
+            status: "queued".to_string(),
+            error: None,
+        }
+    }
+}
+
 /// Create the REST API router
 pub fn create_router(
     block_store: Arc<BlockStore>,
@@ -132,6 +391,33 @@ pub fn create_router(
     keypair: Arc<Keypair>,
     listen_addrs: Arc<RwLock<Vec<Multiaddr>>>,
 ) -> Router {
+    create_router_with_citadel(
+        block_store,
+        metrics,
+        peer_id,
+        botg,
+        keypair,
+        listen_addrs,
+        None,
+    )
+}
+
+/// Create the REST API router with optional Citadel mode state.
+pub fn create_router_with_citadel(
+    block_store: Arc<BlockStore>,
+    metrics: Metrics,
+    peer_id: String,
+    botg: Arc<BoTgProtocol>,
+    keypair: Arc<Keypair>,
+    listen_addrs: Arc<RwLock<Vec<Multiaddr>>>,
+    citadel_node: Option<Arc<AsyncRwLock<DefederationNode>>>,
+) -> Router {
+    let fallback_http_peers = Arc::new(fallback_http_peer_urls());
+    let fallback_http_client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(2))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
+
     let state = ApiState {
         block_store,
         metrics,
@@ -139,32 +425,44 @@ pub fn create_router(
         botg,
         keypair,
         listen_addrs,
+        fallback_http_peers,
+        fallback_http_client,
+        ipfs_cluster_pins: Arc::new(AsyncRwLock::new(HashMap::new())),
+        citadel_node,
     };
 
     Router::new()
         .route("/health", get(health_check))
         .route("/metrics", get(metrics_endpoint))
         .route("/api/v1/blocks", post(store_block))
-        .route("/api/v1/blocks/:cid", get(get_block))
+        .route("/api/v1/blocks/{cid}", get(get_block))
         // Archivist-compatible endpoints
         .route(
             "/api/archivist/v1/data",
             get(archivist_list_data).post(archivist_upload),
         )
         .route(
-            "/api/archivist/v1/data/:cid",
+            "/api/archivist/v1/data/raw",
+            post(archivist_upload_raw_block),
+        )
+        .route(
+            "/api/archivist/v1/data/{cid}",
             get(archivist_download_local).delete(archivist_delete),
         )
         .route(
-            "/api/archivist/v1/data/:cid/network",
+            "/api/archivist/v1/data/{cid}/exists",
+            get(archivist_exists),
+        )
+        .route(
+            "/api/archivist/v1/data/{cid}/network",
             post(archivist_download_network_manifest),
         )
         .route(
-            "/api/archivist/v1/data/:cid/network/stream",
+            "/api/archivist/v1/data/{cid}/network/stream",
             get(archivist_download),
         )
         .route(
-            "/api/archivist/v1/data/:cid/network/manifest",
+            "/api/archivist/v1/data/{cid}/network/manifest",
             get(archivist_download_network_manifest),
         )
         .route("/api/archivist/v1/space", get(archivist_space))
@@ -172,8 +470,51 @@ pub fn create_router(
         .route("/api/archivist/v1/peerid", get(peer_id_endpoint))
         .route("/api/archivist/v1/stats", get(archivist_stats))
         .route("/api/archivist/v1/spr", get(spr_endpoint))
+        // IPFS Cluster-style compatibility endpoints
         .route(
-            "/api/archivist/v1/connect/:peer_id",
+            "/api/ipfs-cluster/v1/pins",
+            get(ipfs_cluster_list_pins),
+        )
+        .route(
+            "/api/ipfs-cluster/v1/pins/{cid}",
+            get(ipfs_cluster_get_pin)
+                .post(ipfs_cluster_pin_cid)
+                .delete(ipfs_cluster_unpin_cid),
+        )
+        .route(
+            "/api/ipfs-cluster/v1/pins/{cid}/recover",
+            post(ipfs_cluster_recover_pin),
+        )
+        .route(
+            "/api/ipfs-cluster/v1/allocations",
+            get(ipfs_cluster_list_pins),
+        )
+        .route(
+            "/api/ipfs-cluster/v1/allocations/{cid}",
+            get(ipfs_cluster_get_pin),
+        )
+        .route("/api/citadel/v1/status", get(citadel_status))
+        .route("/api/citadel/v1/view/{site_id}", get(citadel_view))
+        .route("/api/citadel/v1/follow/{site_id}", post(citadel_follow))
+        .route("/api/citadel/v1/unfollow/{site_id}", post(citadel_unfollow))
+        .route(
+            "/api/citadel/v1/content/{content_slot}/{present}",
+            post(citadel_content),
+        )
+        .route(
+            "/api/citadel/v1/simulate",
+            post(citadel_simulate),
+        )
+        .route(
+            "/api/citadel/v1/sync/pull",
+            post(citadel_sync_pull),
+        )
+        .route(
+            "/api/citadel/v1/sync/push",
+            post(citadel_sync_push),
+        )
+        .route(
+            "/api/archivist/v1/connect/{peer_id}",
             get(connect_not_supported),
         )
         .route(
@@ -181,7 +522,7 @@ pub fn create_router(
             get(marketplace_persistence_disabled),
         )
         .route(
-            "/api/archivist/v1/sales/slots/:slot_id",
+            "/api/archivist/v1/sales/slots/{slot_id}",
             get(marketplace_persistence_disabled),
         )
         .route(
@@ -189,7 +530,7 @@ pub fn create_router(
             get(marketplace_persistence_disabled).post(marketplace_persistence_disabled),
         )
         .route(
-            "/api/archivist/v1/storage/request/:cid",
+            "/api/archivist/v1/storage/request/{cid}",
             post(marketplace_persistence_disabled),
         )
         .route(
@@ -197,7 +538,7 @@ pub fn create_router(
             get(marketplace_persistence_disabled),
         )
         .route(
-            "/api/archivist/v1/storage/purchases/:id",
+            "/api/archivist/v1/storage/purchases/{id}",
             get(marketplace_persistence_disabled),
         )
         .route("/api/archivist/v1/debug/info", get(debug_info_endpoint))
@@ -206,11 +547,11 @@ pub fn create_router(
             post(loglevel_not_supported),
         )
         .route(
-            "/api/archivist/v1/debug/peer/:peer_id",
+            "/api/archivist/v1/debug/peer/{peer_id}",
             get(debug_peer_not_supported),
         )
         .route(
-            "/api/archivist/v1/debug/testing/option/:key/:value",
+            "/api/archivist/v1/debug/testing/option/{key}/{value}",
             post(debug_testing_not_supported),
         )
         .with_state(state)
@@ -245,6 +586,244 @@ async fn metrics_endpoint(State(state): State<ApiState>) -> impl IntoResponse {
         [("content-type", "text/plain; version=0.0.4")],
         metrics,
     )
+}
+
+async fn citadel_status(State(state): State<ApiState>) -> impl IntoResponse {
+    let Some(node) = state.citadel_node else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "enabled": false,
+                "error": "citadel mode not enabled"
+            })),
+        );
+    };
+
+    let node = node.read().await;
+    (
+        StatusCode::OK,
+        Json(json!({
+            "enabled": true,
+            "status": node.status(),
+        })),
+    )
+}
+
+async fn citadel_view(
+    State(state): State<ApiState>,
+    Path(site_id): Path<u64>,
+) -> impl IntoResponse {
+    let Some(node) = state.citadel_node else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "error": "citadel mode not enabled"
+            })),
+        );
+    };
+
+    let node = node.read().await;
+    let reachable = node.graph.reachable_sites(site_id);
+    let visible = node.graph.visible_content(site_id);
+    let digest = node.view_digest_hex(site_id);
+    (
+        StatusCode::OK,
+        Json(json!({
+            "site_id": site_id,
+            "reachable_sites": reachable.len(),
+            "visible_items": visible.len(),
+            "view_digest": digest,
+        })),
+    )
+}
+
+async fn citadel_follow(
+    State(state): State<ApiState>,
+    Path(site_id): Path<u64>,
+) -> impl IntoResponse {
+    let Some(node) = state.citadel_node else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "error": "citadel mode not enabled"
+            })),
+        );
+    };
+    let mut node = node.write().await;
+    let op = node.emit_local_follow(site_id, true);
+    (
+        StatusCode::OK,
+        Json(json!({
+            "ok": true,
+            "origin": op.origin,
+            "counter": op.counter,
+            "target_site_id": site_id,
+            "enabled": true,
+        })),
+    )
+}
+
+async fn citadel_unfollow(
+    State(state): State<ApiState>,
+    Path(site_id): Path<u64>,
+) -> impl IntoResponse {
+    let Some(node) = state.citadel_node else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "error": "citadel mode not enabled"
+            })),
+        );
+    };
+    let mut node = node.write().await;
+    let op = node.emit_local_follow(site_id, false);
+    (
+        StatusCode::OK,
+        Json(json!({
+            "ok": true,
+            "origin": op.origin,
+            "counter": op.counter,
+            "target_site_id": site_id,
+            "enabled": false,
+        })),
+    )
+}
+
+fn parse_boolish(s: &str) -> Option<bool> {
+    match s.to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+
+async fn citadel_content(
+    State(state): State<ApiState>,
+    Path((content_slot, present_raw)): Path<(u64, String)>,
+) -> impl IntoResponse {
+    let Some(node) = state.citadel_node else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "error": "citadel mode not enabled"
+            })),
+        );
+    };
+    let Some(present) = parse_boolish(&present_raw) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "present must be one of true/false/1/0/yes/no/on/off"
+            })),
+        );
+    };
+
+    let mut node = node.write().await;
+    let op = node.emit_local_content(content_slot, present);
+    (
+        StatusCode::OK,
+        Json(json!({
+            "ok": true,
+            "origin": op.origin,
+            "counter": op.counter,
+            "content_slot": content_slot,
+            "present": present,
+        })),
+    )
+}
+
+async fn citadel_simulate(
+    State(state): State<ApiState>,
+    Json(mut cfg): Json<DefederationSimulationConfig>,
+) -> impl IntoResponse {
+    if let Some(node) = state.citadel_node {
+        let node = node.read().await;
+        cfg.guard.base_pow_bits = node.guard_cfg.base_pow_bits;
+        cfg.guard.trusted_pow_bits = node.guard_cfg.trusted_pow_bits;
+        cfg.guard.max_ops_per_origin_per_round = node.guard_cfg.max_ops_per_origin_per_round;
+        cfg.guard.max_new_origins_per_host_per_round =
+            node.guard_cfg.max_new_origins_per_host_per_round;
+        cfg.guard.max_pending_per_origin = node.guard_cfg.max_pending_per_origin;
+        cfg.idle_gate.max_idle_bytes_per_sec = node.idle_bandwidth_bytes_per_sec;
+    }
+
+    let result = tokio::task::spawn_blocking(move || run_defederation_simulation(&cfg)).await;
+    match result {
+        Ok(out) => (StatusCode::OK, Json(json!({ "ok": true, "result": out }))),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "ok": false,
+                "error": format!("simulation worker failed: {}", e)
+            })),
+        ),
+    }
+}
+
+async fn citadel_sync_pull(
+    State(state): State<ApiState>,
+    Json(req): Json<CitadelSyncPullRequest>,
+) -> Response {
+    let Some(node) = state.citadel_node else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "error": "citadel mode not enabled"
+            })),
+        )
+            .into_response();
+    };
+
+    let node = node.read().await;
+    let accepted = 0usize;
+    let max_ops = req.max_ops.unwrap_or(256).clamp(1, 4096);
+    let ops = node.missing_ops_for_frontier(&req.frontier, max_ops);
+    let provided_ops = ops.len();
+    let frontier = node.frontier_snapshot();
+    let status = node.status();
+    let response = CitadelSyncPullResponse {
+        node_id: status.node_id,
+        round: req.round,
+        accepted_local_ops: accepted,
+        provided_ops,
+        frontier,
+        ops,
+        status,
+    };
+    (StatusCode::OK, Json(response)).into_response()
+}
+
+async fn citadel_sync_push(
+    State(state): State<ApiState>,
+    Json(req): Json<CitadelSyncPushRequest>,
+) -> Response {
+    let Some(node) = state.citadel_node else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "error": "citadel mode not enabled"
+            })),
+        )
+            .into_response();
+    };
+
+    let mut node = node.write().await;
+    let accepted_ops = node.ingest_batch(req.round, req.ops);
+    let max_ops = req.max_ops.unwrap_or(256).clamp(1, 4096);
+    let ops = node.missing_ops_for_frontier(&req.frontier, max_ops);
+    let provided_ops = ops.len();
+    let frontier = node.frontier_snapshot();
+    let status = node.status();
+    let response = CitadelSyncPushResponse {
+        node_id: status.node_id,
+        round: req.round,
+        accepted_ops,
+        provided_ops,
+        frontier,
+        ops,
+        status,
+    };
+    (StatusCode::OK, Json(response)).into_response()
 }
 
 /// Store a block (POST /api/v1/blocks)
@@ -552,6 +1131,150 @@ async fn archivist_delete(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// Archivist exists endpoint (GET /api/archivist/v1/data/:cid/exists)
+async fn archivist_exists(
+    State(state): State<ApiState>,
+    Path(cid_str): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let cid: Cid = cid_str
+        .parse()
+        .map_err(|e| ApiError::BadRequest(format!("Invalid CID: {}", e)))?;
+    let exists = state.block_store.has(&cid).await;
+    Ok(Json(serde_json::json!({
+        "cid": cid_str,
+        "exists": exists
+    })))
+}
+
+async fn set_ipfs_cluster_pin_status(
+    state: &ApiState,
+    cid_str: &str,
+    status: &str,
+    error: Option<String>,
+) {
+    let mut pins = state.ipfs_cluster_pins.write().await;
+    if let Some(record) = pins.get_mut(cid_str) {
+        record.status = status.to_string();
+        record.error = error;
+    }
+}
+
+async fn ensure_pin_locally(state: &ApiState, cid_str: &str) -> Result<(), String> {
+    let cid: Cid = cid_str
+        .parse()
+        .map_err(|e| format!("invalid cid {}: {}", cid_str, e))?;
+    if state.block_store.has(&cid).await {
+        return Ok(());
+    }
+    let _ = fetch_cid_from_peers(state, &cid, cid_str)
+        .await
+        .map_err(|e| format!("{:?}", e))?;
+    if state.block_store.has(&cid).await {
+        Ok(())
+    } else {
+        Err("content fetched but not persisted under requested CID".to_string())
+    }
+}
+
+/// IPFS Cluster compatible: pin a CID (POST /api/ipfs-cluster/v1/pins/:cid)
+async fn ipfs_cluster_pin_cid(
+    State(state): State<ApiState>,
+    Path(cid_str): Path<String>,
+    body: Option<Json<IpfsClusterPinRequest>>,
+) -> Result<Json<IpfsClusterPinRecord>, ApiError> {
+    let _: Cid = cid_str
+        .parse()
+        .map_err(|e| ApiError::BadRequest(format!("Invalid CID: {}", e)))?;
+    let request = body.map_or_else(IpfsClusterPinRequest::default, |b| b.0);
+    let record = IpfsClusterPinRecord::from_request(cid_str.clone(), request);
+
+    {
+        let mut pins = state.ipfs_cluster_pins.write().await;
+        pins.insert(cid_str.clone(), record.clone());
+    }
+
+    let state_bg = state.clone();
+    let cid_bg = cid_str.clone();
+    tokio::spawn(async move {
+        set_ipfs_cluster_pin_status(&state_bg, &cid_bg, "pinning", None).await;
+        match ensure_pin_locally(&state_bg, &cid_bg).await {
+            Ok(()) => set_ipfs_cluster_pin_status(&state_bg, &cid_bg, "pinned", None).await,
+            Err(e) => set_ipfs_cluster_pin_status(&state_bg, &cid_bg, "pin_error", Some(e)).await,
+        }
+    });
+
+    Ok(Json(record))
+}
+
+/// IPFS Cluster compatible: get pin info (GET /api/ipfs-cluster/v1/pins/:cid)
+async fn ipfs_cluster_get_pin(
+    State(state): State<ApiState>,
+    Path(cid_str): Path<String>,
+) -> Result<Json<IpfsClusterPinRecord>, ApiError> {
+    let pins = state.ipfs_cluster_pins.read().await;
+    let record = pins
+        .get(&cid_str)
+        .cloned()
+        .ok_or_else(|| ApiError::NotFound(cid_str.clone()))?;
+    Ok(Json(record))
+}
+
+/// IPFS Cluster compatible: list pins (GET /api/ipfs-cluster/v1/pins)
+async fn ipfs_cluster_list_pins(
+    State(state): State<ApiState>,
+) -> Result<Json<Vec<IpfsClusterPinRecord>>, ApiError> {
+    let pins = state.ipfs_cluster_pins.read().await;
+    let list = pins.values().cloned().collect::<Vec<_>>();
+    Ok(Json(list))
+}
+
+/// IPFS Cluster compatible: unpin (DELETE /api/ipfs-cluster/v1/pins/:cid)
+async fn ipfs_cluster_unpin_cid(
+    State(state): State<ApiState>,
+    Path(cid_str): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    let cid: Cid = cid_str
+        .parse()
+        .map_err(|e| ApiError::BadRequest(format!("Invalid CID: {}", e)))?;
+    {
+        let mut pins = state.ipfs_cluster_pins.write().await;
+        pins.remove(&cid_str);
+    }
+    let _ = state.block_store.delete(&cid).await;
+    Ok(StatusCode::ACCEPTED)
+}
+
+/// IPFS Cluster compatible: recover pin (POST /api/ipfs-cluster/v1/pins/:cid/recover)
+async fn ipfs_cluster_recover_pin(
+    State(state): State<ApiState>,
+    Path(cid_str): Path<String>,
+) -> Result<Json<IpfsClusterPinRecord>, ApiError> {
+    {
+        let mut pins = state.ipfs_cluster_pins.write().await;
+        let entry = pins
+            .entry(cid_str.clone())
+            .or_insert_with(|| IpfsClusterPinRecord::from_request(cid_str.clone(), Default::default()));
+        entry.status = "queued".to_string();
+        entry.error = None;
+    }
+    let state_bg = state.clone();
+    let cid_bg = cid_str.clone();
+    tokio::spawn(async move {
+        set_ipfs_cluster_pin_status(&state_bg, &cid_bg, "pinning", None).await;
+        match ensure_pin_locally(&state_bg, &cid_bg).await {
+            Ok(()) => set_ipfs_cluster_pin_status(&state_bg, &cid_bg, "pinned", None).await,
+            Err(e) => set_ipfs_cluster_pin_status(&state_bg, &cid_bg, "pin_error", Some(e)).await,
+        }
+    });
+
+    let pins = state.ipfs_cluster_pins.read().await;
+    let record = pins
+        .get(&cid_str)
+        .cloned()
+        .ok_or_else(|| ApiError::NotFound(cid_str))?;
+    Ok(Json(record))
+}
+
 /// Archivist network manifest endpoint
 /// (GET/POST /api/archivist/v1/data/:cid/network/manifest, /network)
 async fn archivist_download_network_manifest(
@@ -640,23 +1363,33 @@ async fn debug_testing_not_supported() -> Result<StatusCode, ApiError> {
 /// Archivist-compatible upload endpoint (POST /api/archivist/v1/data)
 /// Returns manifest CID as plain text
 async fn archivist_upload(State(state): State<ApiState>, body: Body) -> Result<String, ApiError> {
-    use bytes::BytesMut;
     use futures::StreamExt;
+    use std::collections::HashSet;
 
     let block_size = upload_block_size();
-    let commit_batch_blocks = upload_commit_batch_blocks();
+    let commit_batch_blocks = upload_commit_batch_blocks(block_size);
+    let dedupe_blocks = upload_dedupe_blocks();
     info!(
-        "Archivist API: Streaming upload started (block_size={}, commit_batch_blocks={})",
-        block_size, commit_batch_blocks
+        "Archivist API: Streaming upload started (block_size={}, commit_batch_blocks={}, dedupe_blocks={})",
+        block_size, commit_batch_blocks, dedupe_blocks
     );
 
     // Stream chunks from the request body and store fixed-size blocks immediately.
     // This keeps memory bounded instead of buffering the full upload in RAM.
     let mut stream = body.into_data_stream();
-    let mut pending = BytesMut::with_capacity(block_size * 2);
+    let mut current_block = Vec::with_capacity(block_size);
     let mut dataset_size: u64 = 0;
     let mut block_cids = Vec::new();
-    let mut batch = Vec::with_capacity(commit_batch_blocks);
+    let mut block_cid_slots: Vec<Option<Cid>> = Vec::new();
+    let mut raw_batch: Vec<Vec<u8>> = Vec::with_capacity(commit_batch_blocks);
+    let max_inflight_batches = upload_inflight_batches();
+    let mut inflight_no_dedupe = futures::stream::FuturesUnordered::new();
+    let mut next_batch_start_idx: usize = 0;
+    let mut seen_cids = if dedupe_blocks {
+        Some(HashSet::<Cid>::new())
+    } else {
+        None
+    };
 
     while let Some(next) = stream.next().await {
         let chunk =
@@ -668,38 +1401,118 @@ async fn archivist_upload(State(state): State<ApiState>, body: Body) -> Result<S
         dataset_size = dataset_size
             .checked_add(chunk.len() as u64)
             .ok_or_else(|| ApiError::BadRequest("Upload too large".to_string()))?;
-        pending.extend_from_slice(&chunk);
+        let mut rem = chunk.as_ref();
+        while !rem.is_empty() {
+            let need = block_size.saturating_sub(current_block.len());
+            let take = need.min(rem.len());
+            current_block.extend_from_slice(&rem[..take]);
+            rem = &rem[take..];
 
-        while pending.len() >= block_size {
-            let block_bytes = pending.split_to(block_size).to_vec();
-            let block = Block::new(block_bytes)
-                .map_err(|e| ApiError::Internal(format!("Failed to create block: {}", e)))?;
+            if current_block.len() == block_size {
+                raw_batch.push(std::mem::replace(
+                    &mut current_block,
+                    Vec::with_capacity(block_size),
+                ));
+                if !dedupe_blocks {
+                    block_cid_slots.push(None);
+                }
+            }
+            if raw_batch.len() >= commit_batch_blocks {
+                if dedupe_blocks {
+                    flush_upload_raw_batch(&state, &mut raw_batch, &mut seen_cids, &mut block_cids)
+                        .await?;
+                } else {
+                    let start_idx = next_batch_start_idx;
+                    let expected_len = raw_batch.len();
+                    next_batch_start_idx = next_batch_start_idx.saturating_add(expected_len);
+                    let batch = std::mem::take(&mut raw_batch);
+                    let block_store = Arc::clone(&state.block_store);
+                    inflight_no_dedupe.push(tokio::spawn(async move {
+                        let cids = process_upload_raw_batch_no_dedupe(block_store, batch).await?;
+                        Ok::<(usize, usize, Vec<Cid>), ApiError>((start_idx, expected_len, cids))
+                    }));
 
-            block_cids.push(block.cid);
-            batch.push(block);
-            if batch.len() >= commit_batch_blocks {
-                state
-                    .block_store
-                    .put_many(std::mem::take(&mut batch))
-                    .await
-                    .map_err(|e| ApiError::Internal(format!("Failed to store block batch: {}", e)))?;
+                    while inflight_no_dedupe.len() > max_inflight_batches {
+                        let completed = inflight_no_dedupe.next().await.ok_or_else(|| {
+                            ApiError::Internal("Upload pipeline ended unexpectedly".to_string())
+                        })?;
+                        let (start_idx, expected_len, cids) = completed.map_err(|e| {
+                            ApiError::Internal(format!("Upload batch task failed: {}", e))
+                        })??;
+                        if cids.len() != expected_len {
+                            return Err(ApiError::Internal(format!(
+                                "Upload batch CID count mismatch: expected {}, got {}",
+                                expected_len,
+                                cids.len()
+                            )));
+                        }
+                        for (offset, cid) in cids.into_iter().enumerate() {
+                            let pos = start_idx + offset;
+                            if pos >= block_cid_slots.len() {
+                                return Err(ApiError::Internal(format!(
+                                    "Upload CID slot out of bounds: {} >= {}",
+                                    pos,
+                                    block_cid_slots.len()
+                                )));
+                            }
+                            block_cid_slots[pos] = Some(cid);
+                        }
+                    }
+                }
             }
         }
     }
 
-    if !pending.is_empty() {
-        let block = Block::new(pending.to_vec())
-            .map_err(|e| ApiError::Internal(format!("Failed to create final block: {}", e)))?;
-        block_cids.push(block.cid);
-        batch.push(block);
+    if !current_block.is_empty() {
+        raw_batch.push(current_block);
+        if !dedupe_blocks {
+            block_cid_slots.push(None);
+        }
     }
 
-    if !batch.is_empty() {
-        state
-            .block_store
-            .put_many(batch)
-            .await
-            .map_err(|e| ApiError::Internal(format!("Failed to store final block batch: {}", e)))?;
+    if dedupe_blocks {
+        flush_upload_raw_batch(&state, &mut raw_batch, &mut seen_cids, &mut block_cids).await?;
+    } else {
+        if !raw_batch.is_empty() {
+            let start_idx = next_batch_start_idx;
+            let expected_len = raw_batch.len();
+            let block_store = Arc::clone(&state.block_store);
+            let batch = std::mem::take(&mut raw_batch);
+            inflight_no_dedupe.push(tokio::spawn(async move {
+                let cids = process_upload_raw_batch_no_dedupe(block_store, batch).await?;
+                Ok::<(usize, usize, Vec<Cid>), ApiError>((start_idx, expected_len, cids))
+            }));
+        }
+        while let Some(completed) = inflight_no_dedupe.next().await {
+            let (start_idx, expected_len, cids) = completed
+                .map_err(|e| ApiError::Internal(format!("Upload batch task failed: {}", e)))??;
+            if cids.len() != expected_len {
+                return Err(ApiError::Internal(format!(
+                    "Upload batch CID count mismatch: expected {}, got {}",
+                    expected_len,
+                    cids.len()
+                )));
+            }
+            for (offset, cid) in cids.into_iter().enumerate() {
+                let pos = start_idx + offset;
+                if pos >= block_cid_slots.len() {
+                    return Err(ApiError::Internal(format!(
+                        "Upload CID slot out of bounds: {} >= {}",
+                        pos,
+                        block_cid_slots.len()
+                    )));
+                }
+                block_cid_slots[pos] = Some(cid);
+            }
+        }
+        block_cids = block_cid_slots
+            .into_iter()
+            .map(|maybe| {
+                maybe.ok_or_else(|| {
+                    ApiError::Internal("Upload pipeline missing CID slot".to_string())
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
     }
 
     if dataset_size == 0 {
@@ -728,7 +1541,7 @@ async fn archivist_upload(State(state): State<ApiState>, body: Body) -> Result<S
     let tree_block_list = tree.serialize_block_list();
 
     // Create a block from the serialized data
-    let tree_metadata_block = Block::new(tree_block_list)
+    let tree_metadata_block = Block::new_sha256(tree_block_list)
         .map_err(|e| ApiError::Internal(format!("Failed to create tree metadata block: {}", e)))?;
 
     let tree_metadata_cid = tree_metadata_block.cid;
@@ -754,7 +1567,7 @@ async fn archivist_upload(State(state): State<ApiState>, body: Body) -> Result<S
         block_size as u64,
         dataset_size,
         None,                                            // codec (uses default 0xcd02)
-        Some(BLAKE3_CODEC),                              // hcodec (BLAKE3)
+        Some(SHA256_CODEC),                              // hcodec (SHA2-256)
         None,                                            // version (uses default 1)
         Some(format!("metadata:{}", tree_metadata_cid)), // filename (stores metadata CID)
         None,                                            // mimetype
@@ -793,8 +1606,118 @@ async fn archivist_upload(State(state): State<ApiState>, body: Body) -> Result<S
     Ok(cid_to_string(&manifest_cid))
 }
 
+/// Fast path upload endpoint (POST /api/archivist/v1/data/raw)
+/// Stores request body as a single block and returns block CID as plain text.
+async fn archivist_upload_raw_block(
+    State(state): State<ApiState>,
+    body: Body,
+) -> Result<String, ApiError> {
+    use futures::StreamExt;
+
+    let mut stream = body.into_data_stream();
+    let mut data = Vec::new();
+    while let Some(next) = stream.next().await {
+        let chunk =
+            next.map_err(|e| ApiError::Internal(format!("Failed to read body stream: {}", e)))?;
+        if !chunk.is_empty() {
+            data.extend_from_slice(&chunk);
+        }
+    }
+
+    if data.is_empty() {
+        return Err(ApiError::BadRequest("Empty data".to_string()));
+    }
+
+    let block = Block::new_sha256(data)
+        .map_err(|e| ApiError::Internal(format!("Failed to create block: {}", e)))?;
+    let cid = block.cid;
+    state
+        .block_store
+        .put(block)
+        .await
+        .map_err(|e| ApiError::Internal(format!("Failed to store block: {}", e)))?;
+    Ok(cid_to_string(&cid))
+}
+
 /// Archivist-compatible download endpoint (GET /api/archivist/v1/data/:cid/network/stream)
 /// Returns raw binary data
+async fn fetch_cid_from_peers(state: &ApiState, cid: &Cid, cid_str: &str) -> Result<Vec<u8>, ApiError> {
+    info!(
+        "Archivist API: Block {} not found locally, fetching from peers",
+        cid_str
+    );
+
+    let client = state.fallback_http_client.clone();
+    let fallback_peers = state.fallback_http_peers.as_ref();
+
+    // In the common pair-benchmark case we have exactly one peer;
+    // skip allocations and shuffling on every miss.
+    let mut peers = fallback_peers.clone();
+    if peers.len() > 1 {
+        peers.shuffle(&mut rand::thread_rng());
+    }
+
+    for base_url in peers.iter().take(25) {
+        let url = format!(
+            "{}/api/archivist/v1/data/{}/network/stream",
+            base_url, cid_str
+        );
+
+        info!(
+            "Archivist API: Trying to fetch {} from {}",
+            cid_str, base_url
+        );
+
+        match client.get(&url).send().await {
+            Ok(resp) => {
+                if resp.status().is_success() {
+                    match resp.bytes().await {
+                        Ok(data) => {
+                            info!(
+                                "Archivist API: Fetched {} from {} ({} bytes)",
+                                cid_str,
+                                base_url,
+                                data.len()
+                            );
+
+                            // Avoid storing fetched bytes under manifest CID.
+                            if cid.codec() != 0xcd01 {
+                                let block =
+                                    Block::from_cid_and_data(cid.clone(), data.to_vec()).map_err(|e| {
+                                    ApiError::Internal(format!("Failed to create block: {}", e))
+                                })?;
+                                state.block_store.put(block).await.map_err(|e| {
+                                    ApiError::Internal(format!("Failed to store block: {}", e))
+                                })?;
+                            }
+
+                            return Ok(data.to_vec());
+                        }
+                        Err(e) => {
+                            info!(
+                                "Archivist API: Failed to read response from {}: {}",
+                                base_url, e
+                            );
+                        }
+                    }
+                } else {
+                    info!(
+                        "Archivist API: Got HTTP {} from {}",
+                        resp.status(),
+                        base_url
+                    );
+                }
+            }
+            Err(e) => {
+                info!("Archivist API: Failed to fetch from {}: {}", base_url, e);
+            }
+        }
+    }
+
+    info!("Archivist API: Block {} not available from any peer", cid_str);
+    Err(ApiError::NotFound(cid_str.to_string()))
+}
+
 async fn archivist_download(
     State(state): State<ApiState>,
     Path(cid_str): Path<String>,
@@ -809,121 +1732,7 @@ async fn archivist_download(
     // Try to get content from local store first.
     match retrieve_local_cid_data(&state, &cid, &cid_str).await {
         Ok(data) => Ok(data),
-        Err(ApiError::NotFound(_)) => {
-            // Block not found locally - try fetching from known peers via HTTP
-            // This is a temporary solution - in production would use BlockExc/BoTG
-            info!(
-                "Archivist API: Block {} not found locally, fetching from peers",
-                cid_str
-            );
-
-            // Try all known peers in Docker network (Archivist-style peer discovery)
-            // Generate peer list: bootstrap + node1..node49 (for 50 node cluster)
-            let mut peer_urls = vec![];
-
-            // Add Docker network peers
-            peer_urls.push("http://bootstrap:8080".to_string());
-            for i in 1..50 {
-                peer_urls.push(format!("http://node{}:8080", i));
-            }
-
-            // Add known external Archivist testnet peers (try multiple ports)
-            let external_peers = vec![
-                "91.98.135.54",
-                "10.7.1.200", // blackberry
-            ];
-            for peer in external_peers {
-                // Try common Archivist API ports
-                for port in [8080, 8070, 8000, 3000] {
-                    peer_urls.push(format!("http://{}:{}", peer, port));
-                }
-            }
-
-            let client = reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(2))
-                .build()
-                .map_err(|e| ApiError::Internal(format!("Failed to create HTTP client: {}", e)))?;
-
-            // Shuffle peers for load distribution (Archivist-style)
-            {
-                let mut rng = rand::thread_rng();
-                peer_urls.shuffle(&mut rng);
-            }
-
-            for base_url in peer_urls.iter().take(25) {
-                // Try up to 25 random peers
-                let url = format!(
-                    "{}/api/archivist/v1/data/{}/network/stream",
-                    base_url, cid_str
-                );
-
-                info!(
-                    "Archivist API: Trying to fetch {} from {}",
-                    cid_str, base_url
-                );
-
-                match client.get(&url).send().await {
-                    Ok(resp) => {
-                        if resp.status().is_success() {
-                            match resp.bytes().await {
-                                Ok(data) => {
-                                    info!(
-                                        "Archivist API: Fetched {} from {} ({} bytes)",
-                                        cid_str,
-                                        base_url,
-                                        data.len()
-                                    );
-
-                                    // Avoid storing fetched bytes under manifest CID.
-                                    if cid.codec() != 0xcd01 {
-                                        let block = Block::new(data.to_vec()).map_err(|e| {
-                                            ApiError::Internal(format!(
-                                                "Failed to create block: {}",
-                                                e
-                                            ))
-                                        })?;
-
-                                        state.block_store.put(block.clone()).await.map_err(
-                                            |e| {
-                                                ApiError::Internal(format!(
-                                                    "Failed to store block: {}",
-                                                    e
-                                                ))
-                                            },
-                                        )?;
-
-                                        return Ok(block.data);
-                                    }
-
-                                    return Ok(data.to_vec());
-                                }
-                                Err(e) => {
-                                    info!(
-                                        "Archivist API: Failed to read response from {}: {}",
-                                        base_url, e
-                                    );
-                                }
-                            }
-                        } else {
-                            info!(
-                                "Archivist API: Got HTTP {} from {}",
-                                resp.status(),
-                                base_url
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        info!("Archivist API: Failed to fetch from {}: {}", base_url, e);
-                    }
-                }
-            }
-
-            info!(
-                "Archivist API: Block {} not available from any peer",
-                cid_str
-            );
-            Err(ApiError::NotFound(cid_str.clone()))
-        }
+        Err(ApiError::NotFound(_)) => fetch_cid_from_peers(&state, &cid, &cid_str).await,
         Err(e) => Err(e),
     }
 }
@@ -1022,6 +1831,10 @@ mod tests {
     use super::*;
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
+    use crate::citadel::{
+        CitadelSyncPullResponse, CitadelSyncPushResponse, DefederationGuardConfig,
+        DefederationNode,
+    };
     use tower::util::ServiceExt;
 
     #[tokio::test]
@@ -1169,5 +1982,219 @@ mod tests {
 
         let response = app.clone().oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_citadel_status_disabled_when_mode_off() {
+        use crate::botg::BoTgConfig;
+        use libp2p::identity::Keypair;
+
+        let block_store = Arc::new(BlockStore::new());
+        let metrics = Metrics::new();
+        let botg = Arc::new(BoTgProtocol::new(BoTgConfig::default()));
+        let keypair = Arc::new(Keypair::generate_ed25519());
+        let listen_addrs = Arc::new(RwLock::new(vec!["/ip4/127.0.0.1/tcp/8070"
+            .parse()
+            .unwrap()]));
+        let app = create_router(
+            block_store,
+            metrics,
+            "12D3KooWTest123".to_string(),
+            botg,
+            keypair,
+            listen_addrs,
+        );
+
+        let request = Request::builder()
+            .uri("/api/citadel/v1/status")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn test_citadel_follow_and_view_endpoints() {
+        use crate::botg::BoTgConfig;
+        use libp2p::identity::Keypair;
+
+        let block_store = Arc::new(BlockStore::new());
+        let metrics = Metrics::new();
+        let botg = Arc::new(BoTgProtocol::new(BoTgConfig::default()));
+        let keypair = Arc::new(Keypair::generate_ed25519());
+        let listen_addrs = Arc::new(RwLock::new(vec!["/ip4/127.0.0.1/tcp/8070"
+            .parse()
+            .unwrap()]));
+
+        let guard = DefederationGuardConfig::default();
+        let citadel = Arc::new(AsyncRwLock::new(DefederationNode::new(
+            42,
+            0,
+            1,
+            std::collections::HashSet::from([42]),
+            guard,
+        )));
+
+        let app = create_router_with_citadel(
+            block_store,
+            metrics,
+            "12D3KooWTest123".to_string(),
+            botg,
+            keypair,
+            listen_addrs,
+            Some(citadel),
+        );
+
+        let follow_request = Request::builder()
+            .method("POST")
+            .uri("/api/citadel/v1/follow/2")
+            .body(Body::empty())
+            .unwrap();
+        let follow_response = app.clone().oneshot(follow_request).await.unwrap();
+        assert_eq!(follow_response.status(), StatusCode::OK);
+
+        let content_request = Request::builder()
+            .method("POST")
+            .uri("/api/citadel/v1/content/0/true")
+            .body(Body::empty())
+            .unwrap();
+        let content_response = app.clone().oneshot(content_request).await.unwrap();
+        assert_eq!(content_response.status(), StatusCode::OK);
+
+        let view_request = Request::builder()
+            .uri("/api/citadel/v1/view/1")
+            .body(Body::empty())
+            .unwrap();
+        let view_response = app.clone().oneshot(view_request).await.unwrap();
+        assert_eq!(view_response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_citadel_sync_pull_returns_missing_ops() {
+        use crate::botg::BoTgConfig;
+        use libp2p::identity::Keypair;
+
+        let block_store = Arc::new(BlockStore::new());
+        let metrics = Metrics::new();
+        let botg = Arc::new(BoTgProtocol::new(BoTgConfig::default()));
+        let keypair = Arc::new(Keypair::generate_ed25519());
+        let listen_addrs = Arc::new(RwLock::new(vec![
+            "/ip4/127.0.0.1/tcp/8070".parse().unwrap()
+        ]));
+
+        let guard = DefederationGuardConfig::default();
+        let citadel = Arc::new(AsyncRwLock::new(DefederationNode::new(
+            77,
+            0,
+            1,
+            std::collections::HashSet::from([77]),
+            guard,
+        )));
+        {
+            let mut node = citadel.write().await;
+            let _ = node.emit_local_follow(2, true);
+            let _ = node.emit_local_content(5, true);
+        }
+
+        let app = create_router_with_citadel(
+            block_store,
+            metrics,
+            "12D3KooWTest123".to_string(),
+            botg,
+            keypair,
+            listen_addrs,
+            Some(citadel),
+        );
+
+        let body = serde_json::json!({
+            "round": 1,
+            "frontier": {},
+            "max_ops": 8
+        });
+        let request = Request::builder()
+            .method("POST")
+            .uri("/api/citadel/v1/sync/pull")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let out: CitadelSyncPullResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(out.node_id, 77);
+        assert!(out.provided_ops >= 2);
+        assert!(out.ops.len() >= 2);
+        assert_eq!(out.frontier.get(&77).copied().unwrap_or(0), 2);
+    }
+
+    #[tokio::test]
+    async fn test_citadel_sync_push_merges_ops_and_returns_delta() {
+        use crate::botg::BoTgConfig;
+        use libp2p::identity::Keypair;
+
+        let block_store = Arc::new(BlockStore::new());
+        let metrics = Metrics::new();
+        let botg = Arc::new(BoTgProtocol::new(BoTgConfig::default()));
+        let keypair = Arc::new(Keypair::generate_ed25519());
+        let listen_addrs = Arc::new(RwLock::new(vec![
+            "/ip4/127.0.0.1/tcp/8070".parse().unwrap()
+        ]));
+
+        let guard = DefederationGuardConfig::default();
+        let citadel = Arc::new(AsyncRwLock::new(DefederationNode::new(
+            88,
+            0,
+            1,
+            std::collections::HashSet::from([88]),
+            guard,
+        )));
+
+        let outbound_ops = {
+            let mut peer_node = DefederationNode::new(
+                99,
+                1,
+                2,
+                std::collections::HashSet::from([99]),
+                DefederationGuardConfig::default(),
+            );
+            vec![
+                peer_node.emit_local_follow(1, true),
+                peer_node.emit_local_content(7, true),
+            ]
+        };
+
+        let app = create_router_with_citadel(
+            block_store,
+            metrics,
+            "12D3KooWTest123".to_string(),
+            botg,
+            keypair,
+            listen_addrs,
+            Some(citadel),
+        );
+
+        let body = serde_json::json!({
+            "round": 1,
+            "frontier": {},
+            "ops": outbound_ops,
+            "max_ops": 16
+        });
+        let request = Request::builder()
+            .method("POST")
+            .uri("/api/citadel/v1/sync/push")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let out: CitadelSyncPushResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(out.node_id, 88);
+        assert!(out.accepted_ops >= 2);
+        assert!(out.frontier.get(&99).copied().unwrap_or(0) >= 2);
     }
 }

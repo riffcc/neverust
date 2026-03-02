@@ -2,7 +2,7 @@
 
 use futures_util::StreamExt;
 use libp2p::Multiaddr;
-use neverust_core::{blockexc::BlockExcMode, create_swarm, Block, BlockStore, Metrics};
+use neverust_core::{create_swarm, Block, BlockStore, Metrics};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::timeout;
@@ -24,9 +24,9 @@ async fn test_two_nodes_exchange_blocks() -> Result<(), Box<dyn std::error::Erro
 
     // Create two swarms (nodes) with their block stores
     let (mut swarm1, _tx1, _keypair1) =
-        create_swarm(store1.clone(), BlockExcMode::Altruistic, metrics1).await?;
+        create_swarm(store1.clone(), "altruistic".to_string(), 1, metrics1).await?;
     let (mut swarm2, _tx2, _keypair2) =
-        create_swarm(store2.clone(), BlockExcMode::Altruistic, metrics2).await?;
+        create_swarm(store2.clone(), "altruistic".to_string(), 1, metrics2).await?;
 
     let peer1_id = *swarm1.local_peer_id();
     let peer2_id = *swarm2.local_peer_id();
@@ -166,7 +166,7 @@ async fn test_retrieve_from_testnet() -> Result<(), Box<dyn std::error::Error>> 
 
     // Create swarm (node) with block store
     let (mut swarm, block_request_tx, _keypair) =
-        create_swarm(store.clone(), BlockExcMode::Altruistic, metrics.clone()).await?;
+        create_swarm(store.clone(), "altruistic".to_string(), 1, metrics.clone()).await?;
 
     let local_peer_id = *swarm.local_peer_id();
     tracing::info!("Local peer ID: {}", local_peer_id);

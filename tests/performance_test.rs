@@ -1,5 +1,5 @@
 use futures_util::StreamExt;
-use neverust_core::{blockexc::BlockExcMode, create_swarm, Block, BlockStore, Metrics};
+use neverust_core::{create_swarm, Block, BlockStore, Metrics};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::time::{timeout, Duration};
@@ -18,12 +18,14 @@ async fn test_peer_dial_latency() {
     let metrics1 = Metrics::new();
     let metrics2 = Metrics::new();
 
-    let (mut swarm1, _tx1, _keypair1) = create_swarm(store1, BlockExcMode::Altruistic, metrics1)
-        .await
-        .expect("Failed to create swarm1");
-    let (mut swarm2, _tx2, _keypair2) = create_swarm(store2, BlockExcMode::Altruistic, metrics2)
-        .await
-        .expect("Failed to create swarm2");
+    let (mut swarm1, _tx1, _keypair1) =
+        create_swarm(store1, "altruistic".to_string(), 1, metrics1)
+            .await
+            .expect("Failed to create swarm1");
+    let (mut swarm2, _tx2, _keypair2) =
+        create_swarm(store2, "altruistic".to_string(), 1, metrics2)
+            .await
+            .expect("Failed to create swarm2");
 
     // Start listening on swarm1
     swarm1
@@ -87,11 +89,11 @@ async fn test_content_fetch_latency() {
     let metrics2 = Metrics::new();
 
     let (mut swarm1, _tx1, _keypair1) =
-        create_swarm(store1.clone(), BlockExcMode::Altruistic, metrics1)
+        create_swarm(store1.clone(), "altruistic".to_string(), 1, metrics1)
             .await
             .expect("Failed to create swarm1");
     let (mut swarm2, _tx2, _keypair2) =
-        create_swarm(store2.clone(), BlockExcMode::Altruistic, metrics2)
+        create_swarm(store2.clone(), "altruistic".to_string(), 1, metrics2)
             .await
             .expect("Failed to create swarm2");
 
@@ -165,11 +167,11 @@ async fn test_peer_dial_p95() {
         let metrics2 = Metrics::new();
 
         let (mut swarm1, _tx1, _keypair1) =
-            create_swarm(store1, BlockExcMode::Altruistic, metrics1)
+            create_swarm(store1, "altruistic".to_string(), 1, metrics1)
                 .await
                 .expect("Failed to create swarm1");
         let (mut swarm2, _tx2, _keypair2) =
-            create_swarm(store2, BlockExcMode::Altruistic, metrics2)
+            create_swarm(store2, "altruistic".to_string(), 1, metrics2)
                 .await
                 .expect("Failed to create swarm2");
 

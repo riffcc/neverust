@@ -5,12 +5,15 @@
 
 use cid::Cid;
 use multihash::Multihash;
+use sha2::{Digest, Sha256};
 use std::io::{self, Read};
 use thiserror::Error;
 
 /// BLAKE3 multihash code
 /// See: https://github.com/multiformats/multicodec/blob/master/table.csv
 const BLAKE3_CODE: u64 = 0x1e;
+/// SHA2-256 multihash code
+const SHA2_256_CODE: u64 = 0x12;
 
 /// Archivist block codec (codex-block, NOT codex-manifest!)
 /// 0xcd01 = codex-manifest (for metadata)
@@ -47,6 +50,21 @@ pub fn blake3_cid(data: &[u8]) -> Result<Cid, CidError> {
         .map_err(|e| CidError::Multihash(format!("Failed to create multihash: {}", e)))?;
 
     // Create CIDv1 with archivist-block codec (0xcd02)
+    Ok(Cid::new_v1(ARCHIVIST_BLOCK_CODEC, mh))
+}
+
+/// Compute SHA2-256 hash of data
+pub fn sha256_hash(data: &[u8]) -> Vec<u8> {
+    let mut hasher = Sha256::new();
+    hasher.update(data);
+    hasher.finalize().to_vec()
+}
+
+/// Compute Archivist-compatible CID for data using SHA2-256
+pub fn sha256_cid(data: &[u8]) -> Result<Cid, CidError> {
+    let hash = sha256_hash(data);
+    let mh = Multihash::wrap(SHA2_256_CODE, &hash)
+        .map_err(|e| CidError::Multihash(format!("Failed to create multihash: {}", e)))?;
     Ok(Cid::new_v1(ARCHIVIST_BLOCK_CODEC, mh))
 }
 
@@ -139,7 +157,16 @@ impl Default for StreamingVerifier {
 
 /// Verify data against a CID using BLAKE3
 pub fn verify_blake3(data: &[u8], expected_cid: &Cid) -> Result<(), CidError> {
-    let computed_cid = blake3_cid(data)?;
+    let computed_cid = match expected_cid.hash().code() {
+        BLAKE3_CODE => blake3_cid(data)?,
+        SHA2_256_CODE => sha256_cid(data)?,
+        code => {
+            return Err(CidError::InvalidCid(format!(
+                "Unsupported multihash code: 0x{:x}",
+                code
+            )))
+        }
+    };
 
     if &computed_cid != expected_cid {
         return Err(CidError::HashMismatch {
@@ -214,6 +241,14 @@ mod tests {
             Err(CidError::HashMismatch { .. }) => {}
             _ => panic!("Expected HashMismatch error"),
         }
+    }
+
+    #[test]
+    fn test_verify_sha256() {
+        let data = b"hello world";
+        let cid = sha256_cid(data).unwrap();
+        assert!(verify_blake3(data, &cid).is_ok());
+        assert!(verify_blake3(b"not hello world", &cid).is_err());
     }
 
     #[test]
