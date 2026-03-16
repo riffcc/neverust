@@ -118,6 +118,11 @@ pub struct StartCommand {
     #[arg(long)]
     pub bootstrap_node: Vec<String>,
 
+    /// Public address to announce to peers (e.g. /ip4/1.2.3.4/tcp/10700).
+    /// Can be specified multiple times.
+    #[arg(long)]
+    pub announce_addr: Vec<String>,
+
     /// Enable Citadel/Lens mode inside Neverust.
     #[arg(long)]
     pub citadel_mode: bool,
@@ -174,6 +179,8 @@ pub struct Config {
     pub log_level: String,
     #[serde(default)]
     pub bootstrap_nodes: Vec<String>,
+    #[serde(default)]
+    pub announce_addrs: Vec<String>,
     pub mode: String,
     pub price_per_byte: u64,
     #[serde(default)]
@@ -260,6 +267,7 @@ impl Default for Config {
             api_bind: default_api_bind(),
             log_level: "info".to_string(),
             bootstrap_nodes: Vec::new(),
+            announce_addrs: Vec::new(),
             mode: "altruistic".to_string(),
             price_per_byte: 1,
             persistence: false,
@@ -511,6 +519,7 @@ impl From<StartCommand> for Config {
             api_bind: cmd.api_bind,
             log_level: cmd.log_level,
             bootstrap_nodes: cmd.bootstrap_node,
+            announce_addrs: cmd.announce_addr,
             mode: cmd.mode,
             price_per_byte: cmd.price_per_byte,
             persistence: cmd.persistence,

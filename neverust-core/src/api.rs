@@ -264,6 +264,7 @@ pub struct ApiState {
     pub botg: Arc<BoTgProtocol>,
     pub keypair: Arc<Keypair>,
     pub listen_addrs: Arc<RwLock<Vec<Multiaddr>>>,
+    pub announce_addrs: Vec<String>,
     pub fallback_http_peers: Arc<Vec<String>>,
     pub fallback_http_client: reqwest::Client,
     pub ipfs_cluster_pins: Arc<AsyncRwLock<HashMap<String, IpfsClusterPinRecord>>>,
@@ -407,6 +408,7 @@ pub fn create_router(
         None,
         None,
         MarketplaceRuntimeInfo::default(),
+        Vec::new(),
     )
 }
 
@@ -430,6 +432,7 @@ pub fn create_router_with_citadel(
         citadel_node,
         None,
         MarketplaceRuntimeInfo::default(),
+        Vec::new(),
     )
 }
 
@@ -444,6 +447,7 @@ pub fn create_router_with_runtime(
     citadel_node: Option<Arc<AsyncRwLock<DefederationNode>>>,
     marketplace: Option<MarketplaceStore>,
     marketplace_runtime: MarketplaceRuntimeInfo,
+    announce_addrs: Vec<String>,
 ) -> Router {
     let fallback_http_peers = Arc::new(fallback_http_peer_urls());
     let fallback_http_client = reqwest::Client::builder()
@@ -458,6 +462,7 @@ pub fn create_router_with_runtime(
         botg,
         keypair,
         listen_addrs,
+        announce_addrs,
         fallback_http_peers,
         fallback_http_client,
         ipfs_cluster_pins: Arc::new(AsyncRwLock::new(HashMap::new())),
@@ -1467,7 +1472,7 @@ async fn debug_info_endpoint(State(state): State<ApiState>) -> impl IntoResponse
         "addrs": addrs,
         "repo": "unknown",
         "spr": "",
-        "announceAddresses": [],
+        "announceAddresses": state.announce_addrs,
         "ethAddress": marketplace_runtime.eth_account,
         "table": {"localNode": serde_json::Value::Null, "nodes": []},
         "archivist": {

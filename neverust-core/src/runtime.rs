@@ -307,6 +307,7 @@ pub async fn run_node(config: Config) -> Result<(), P2PError> {
         validator: config.validator,
         prover: config.prover,
     };
+    let api_announce_addrs = config.announce_addrs.clone();
     tokio::spawn(async move {
         let app = api::create_router_with_runtime(
             api_block_store,
@@ -318,6 +319,7 @@ pub async fn run_node(config: Config) -> Result<(), P2PError> {
             api_citadel,
             api_marketplace,
             api_marketplace_info,
+            api_announce_addrs,
         );
         let addr = format!("{}:{}", api_bind, api_port);
         info!("Starting REST API on {}", addr);
@@ -365,6 +367,16 @@ pub async fn run_node(config: Config) -> Result<(), P2PError> {
                 }
             }
         });
+    }
+
+    // Register announce addresses so peers know our public address
+    for addr_str in &config.announce_addrs {
+        if let Ok(addr) = addr_str.parse::<Multiaddr>() {
+            swarm.add_external_address(addr.clone());
+            info!("Added external announce address: {}", addr);
+        } else {
+            warn!("Invalid announce address: {}", addr_str);
+        }
     }
 
     // Start listening on TCP (Archivist uses TCP+Noise+Mplex, NOT QUIC)
