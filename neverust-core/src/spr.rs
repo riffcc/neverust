@@ -93,6 +93,93 @@ pub fn parse_spr_records(spr_text: &str) -> Result<Vec<(PeerId, Vec<Multiaddr>)>
     Ok(results)
 }
 
+/// Parsed SPR record with full details.
+#[derive(Clone, Debug)]
+pub struct SprRecord {
+    pub peer_id: PeerId,
+    pub addrs: Vec<Multiaddr>,
+    /// Raw secp256k1 compressed public key bytes (33 bytes).
+    pub secp256k1_pubkey: Option<Vec<u8>>,
+}
+
+/// Parse SPR records returning full details including raw public keys.
+pub fn parse_spr_records_full(spr_text: &str) -> Result<Vec<SprRecord>, SprError> {
+    let mut results = Vec::new();
+
+    for line in spr_text.lines() {
+        if let Some(spr_data) = line.strip_prefix("spr:") {
+            match parse_single_spr_full(spr_data) {
+                Ok(record) => {
+                    tracing::info!(
+                        "Parsed SPR: peer_id={}, addrs={:?}",
+                        record.peer_id,
+                        record.addrs
+                    );
+                    results.push(record);
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to parse SPR record: {}", e);
+                    continue;
+                }
+            }
+        }
+    }
+
+    Ok(results)
+}
+
+/// Parse a single SPR with full details.
+fn parse_single_spr_full(spr_base64: &str) -> Result<SprRecord, SprError> {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+    use libp2p::identity::PublicKey;
+
+    let bytes = URL_SAFE_NO_PAD.decode(spr_base64)?;
+    let spr = ArchivistSpr::decode(&bytes[..])?;
+
+    let peer_id_bytes = spr
+        .peer_id
+        .ok_or_else(|| SprError::Protobuf(prost::DecodeError::new("Missing peer_id")))?;
+
+    let public_key = PublicKey::try_decode_protobuf(&peer_id_bytes)
+        .map_err(|e| SprError::InvalidPeerId(e.to_string()))?;
+
+    // Extract raw secp256k1 compressed key if available
+    let secp256k1_pubkey = if let Ok(secp_key) = public_key.clone().try_into_secp256k1() {
+        Some(secp_key.to_bytes().to_vec())
+    } else {
+        None
+    };
+
+    let peer_id = public_key.to_peer_id();
+
+    let mut addrs = Vec::new();
+    for peer_record_bytes in &spr.peer_record {
+        if let Ok(peer_info) = PeerInfo::decode(&peer_record_bytes[..]) {
+            for addr_bytes in peer_info.addrs {
+                #[derive(Clone, PartialEq, Message)]
+                struct AddrWrapper {
+                    #[prost(bytes = "vec", optional, tag = "1")]
+                    addr: Option<Vec<u8>>,
+                }
+
+                if let Ok(wrapper) = AddrWrapper::decode(&addr_bytes[..]) {
+                    if let Some(raw_addr) = wrapper.addr {
+                        if let Ok(addr) = Multiaddr::try_from(raw_addr) {
+                            addrs.push(addr);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(SprRecord {
+        peer_id,
+        addrs,
+        secp256k1_pubkey,
+    })
+}
+
 /// Parse a single base64-encoded SPR record
 fn parse_single_spr(spr_base64: &str) -> Result<(PeerId, Vec<Multiaddr>), SprError> {
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};

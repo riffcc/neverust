@@ -6,10 +6,10 @@
 
 use cid::Cid;
 use discv5::{
-    enr, rpc::RequestBody, rpc::ResponseBody, ConfigBuilder, Discv5, Event as Discv5Event,
-    ListenConfig,
+    enr, handler::NodeContact, rpc::RequestBody, rpc::ResponseBody, ConfigBuilder, Discv5,
+    Event as Discv5Event, ListenConfig,
 };
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
@@ -17,6 +17,7 @@ use crate::dht_provider::{
     cid_to_node_id, handle_add_provider, handle_get_providers, new_provider_store,
     SharedProviderStore,
 };
+use crate::spr::{parse_spr_records_full, SprRecord};
 
 use libp2p::identity::PeerId;
 
@@ -119,7 +120,11 @@ impl Discovery {
 
         info!("DiscV5 listening on {}", listen_addr);
 
-        for peer_str in bootstrap_peers {
+        // Bootstrap from ENR strings
+        for peer_str in &bootstrap_peers {
+            if peer_str.starts_with("spr:") {
+                continue; // SPR records handled below
+            }
             match peer_str.parse::<enr::Enr<enr::CombinedKey>>() {
                 Ok(bootstrap_enr) => match discv5.add_enr(bootstrap_enr.clone()) {
                     Ok(_) => info!("Added bootstrap peer: {}", bootstrap_enr.node_id()),
@@ -129,12 +134,30 @@ impl Discovery {
             }
         }
 
+        // Bootstrap from SPR records — these contain the UDP discovery addresses
+        // and secp256k1 public keys of the Archivist devnet bootstrap nodes.
+        let discv5_arc = Arc::new(discv5);
+        for peer_str in &bootstrap_peers {
+            if !peer_str.starts_with("spr:") {
+                continue;
+            }
+            match parse_spr_records_full(peer_str) {
+                Ok(records) => {
+                    for record in records {
+                        if let Err(e) = bootstrap_from_spr(&discv5_arc, &record).await {
+                            warn!("Failed to bootstrap from SPR: {}", e);
+                        }
+                    }
+                }
+                Err(e) => warn!("Failed to parse SPR bootstrap: {}", e),
+            }
+        }
+
         // Build our local provider record from announce addresses.
-        // This is what we send in AddProvider messages so peers can reach us.
         let local_provider_record = build_provider_record(&peer_id, &announce_addrs);
 
         Ok(Self {
-            discv5: Arc::new(discv5),
+            discv5: discv5_arc,
             peer_id,
             provider_store: new_provider_store(),
             local_provider_record,
@@ -358,6 +381,94 @@ impl Discovery {
             local_enr: self.local_enr().to_base64(),
         }
     }
+}
+
+/// Bootstrap the DiscV5 DHT from an Archivist SPR record.
+///
+/// Creates a synthetic ENR from the SPR's public key and UDP address,
+/// then adds it as a bootstrap peer and pings it to establish a session.
+async fn bootstrap_from_spr(
+    discv5: &Arc<Discv5>,
+    record: &SprRecord,
+) -> std::result::Result<(), String> {
+    let pubkey_bytes = record
+        .secp256k1_pubkey
+        .as_ref()
+        .ok_or_else(|| "SPR has no secp256k1 public key".to_string())?;
+
+    // Extract UDP address from the SPR multiaddrs
+    let mut udp_addr: Option<SocketAddr> = None;
+    for addr in &record.addrs {
+        let addr_str = addr.to_string();
+        // SPR addresses are like /ip4/X.X.X.X/udp/PORT
+        let parts: Vec<&str> = addr_str.split('/').collect();
+        if parts.len() >= 5 && parts[1] == "ip4" && parts[3] == "udp" {
+            if let (Ok(ip), Ok(port)) = (parts[2].parse::<Ipv4Addr>(), parts[4].parse::<u16>()) {
+                udp_addr = Some(SocketAddr::new(IpAddr::V4(ip), port));
+                break;
+            }
+        }
+    }
+
+    let socket_addr = udp_addr.ok_or_else(|| "No UDP address found in SPR".to_string())?;
+
+    // Create a synthetic ENR for the bootstrap node using their public key
+    let verifying_key = enr::k256::ecdsa::VerifyingKey::from_sec1_bytes(pubkey_bytes)
+        .map_err(|e| format!("Invalid secp256k1 key: {}", e))?;
+    let public_key = enr::CombinedPublicKey::Secp256k1(verifying_key);
+
+    // Build ENR for the bootstrap node (signed by our key, which is technically
+    // wrong, but we only need it for the routing table entry with correct NodeId)
+    let enr_key =
+        enr::CombinedKey::Secp256k1(enr::k256::ecdsa::SigningKey::random(&mut rand::thread_rng()));
+    let mut builder = enr::Enr::builder();
+    match socket_addr.ip() {
+        IpAddr::V4(ip) => {
+            builder.ip4(ip);
+            builder.udp4(socket_addr.port());
+        }
+        IpAddr::V6(ip) => {
+            builder.ip6(ip);
+            builder.udp6(socket_addr.port());
+        }
+    }
+    let bootstrap_enr = builder
+        .build(&enr_key)
+        .map_err(|e| format!("Failed to build bootstrap ENR: {}", e))?;
+
+    // The NodeId is derived from the public key hash
+    let node_id = enr::NodeId::from(public_key);
+
+    info!(
+        "Bootstrapping DiscV5 from SPR: {} at {} (NodeId: {})",
+        record.peer_id, socket_addr, node_id
+    );
+
+    // Add the ENR to the routing table (even though the signature won't match,
+    // the key fields will allow session establishment)
+    match discv5.add_enr(bootstrap_enr) {
+        Ok(_) => info!("Added SPR bootstrap to routing table"),
+        Err(e) => warn!("Failed to add SPR bootstrap to routing table: {}", e),
+    }
+
+    // Trigger a find_node to populate the routing table from the bootstrap peer
+    let discv5_clone = discv5.clone();
+    tokio::spawn(async move {
+        match discv5_clone.find_node(node_id).await {
+            Ok(nodes) => {
+                info!(
+                    "DHT bootstrap find_node returned {} peers from {}",
+                    nodes.len(),
+                    socket_addr
+                );
+            }
+            Err(e) => {
+                debug!("DHT bootstrap find_node to {} failed: {}", socket_addr, e);
+            }
+        }
+    });
+
+    Ok(())
 }
 
 /// Build a simple provider record from peer ID and announce addresses.

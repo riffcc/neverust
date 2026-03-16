@@ -205,19 +205,15 @@ pub async fn run_node(config: Config) -> Result<(), P2PError> {
         config.disc_port
     );
 
-    // Fetch bootstrap ENRs for DiscV5
-    let bootstrap_enrs = Config::fetch_bootstrap_enrs()
-        .await
-        .map_err(|e| P2PError::Transport(format!("Failed to fetch bootstrap ENRs: {}", e)))?;
+    // Pass SPR bootstrap nodes directly to DiscV5 — they contain UDP addresses
+    // and secp256k1 public keys needed for DHT bootstrapping.
+    let discv5_bootstrap: Vec<String> = config.bootstrap_nodes.clone();
 
-    // Get announce addresses for this node (DiscV5 on disc_port, libp2p on listen_port)
-    let announce_addrs = vec![
-        format!("/ip4/0.0.0.0/tcp/{}", config.listen_port), // libp2p TCP
-        format!("/ip4/0.0.0.0/udp/{}", config.disc_port),   // DiscV5 UDP
-    ];
+    // Get announce addresses for this node
+    let announce_addrs = config.announce_addrs.clone();
 
     let discovery =
-        match Discovery::new(&keypair, discv5_addr, announce_addrs, bootstrap_enrs).await {
+        match Discovery::new(&keypair, discv5_addr, announce_addrs, discv5_bootstrap).await {
             Ok(disc) => {
                 info!("DiscV5 initialized successfully on {}", discv5_addr);
                 Some(Arc::new(disc))
