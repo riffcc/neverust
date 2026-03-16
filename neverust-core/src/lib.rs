@@ -13,6 +13,7 @@ pub mod citadel;
 pub mod citadel_sync;
 pub mod cluster;
 pub mod config;
+pub mod dht_provider;
 pub mod discovery;
 pub mod eth_key;
 pub mod identify_shim;

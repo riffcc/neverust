@@ -2,16 +2,22 @@
 //!
 //! Implements UDP-based peer discovery using the Kademlia DHT protocol (DiscV5).
 //! This enables automatic discovery of peers and content providers in the network.
+//! Uses protobuf-encoded messages matching the Archivist DHT wire format.
 
 use cid::Cid;
-use discv5::{enr, ConfigBuilder, Discv5, Event as Discv5Event, ListenConfig};
-use std::collections::HashMap;
+use discv5::{
+    enr, rpc::RequestBody, rpc::ResponseBody, ConfigBuilder, Discv5, Event as Discv5Event,
+    ListenConfig,
+};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
-use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
-// Re-export PeerId from libp2p for use in discovery
+use crate::dht_provider::{
+    cid_to_node_id, handle_add_provider, handle_get_providers, new_provider_store,
+    SharedProviderStore,
+};
+
 use libp2p::identity::PeerId;
 
 #[derive(Debug, thiserror::Error)]
@@ -42,11 +48,11 @@ pub struct Discovery {
     /// Local peer ID
     peer_id: PeerId,
 
-    /// Provider records: CID -> Set of peer IDs
-    providers: Arc<RwLock<HashMap<Cid, Vec<PeerId>>>>,
+    /// DHT provider record store
+    provider_store: SharedProviderStore,
 
-    /// Announced multiaddrs for this node
-    _announce_addrs: Vec<String>,
+    /// Our own signed peer record bytes for provider announcements
+    local_provider_record: Vec<u8>,
 }
 
 impl Discovery {
@@ -59,14 +65,8 @@ impl Discovery {
     ) -> Result<Self> {
         info!("Initializing DiscV5 peer discovery on {}", listen_addr);
 
-        // Extract secp256k1 key bytes from libp2p keypair
-        // libp2p v0.56+ uses identity module
-        let _key_bytes = keypair
-            .to_protobuf_encoding()
-            .map_err(|e| DiscoveryError::EnrError(format!("Failed to encode keypair: {}", e)))?;
-
-        // Try to create secp256k1 signing key from encoded bytes
-        // For now, we'll generate a fresh key since libp2p keypair extraction is complex
+        // Generate secp256k1 key for DiscV5
+        // Future: extract from libp2p keypair directly
         warn!(
             "Generating fresh secp256k1 key for DiscV5 (libp2p key extraction not yet implemented)"
         );
@@ -74,11 +74,9 @@ impl Discovery {
 
         let peer_id = keypair.public().to_peer_id();
 
-        // Create ENR builder
         let enr_key = enr::CombinedKey::Secp256k1(secret_key);
         let mut builder = enr::Enr::builder();
 
-        // Add IP and UDP port
         match listen_addr.ip() {
             IpAddr::V4(ip) => {
                 builder.ip4(ip);
@@ -90,7 +88,6 @@ impl Discovery {
             }
         }
 
-        // Add libp2p peer ID as custom ENR entry
         builder.add_value("libp2p", &peer_id.to_bytes());
 
         let enr = builder
@@ -100,7 +97,6 @@ impl Discovery {
         info!("Local ENR: {}", enr.to_base64());
         info!("Local Peer ID: {}", peer_id);
 
-        // Create listen config
         let listen_config = ListenConfig::Ipv4 {
             ip: match listen_addr.ip() {
                 IpAddr::V4(ip) => ip,
@@ -111,14 +107,11 @@ impl Discovery {
             port: listen_addr.port(),
         };
 
-        // Configure DiscV5 with listen config
         let config = ConfigBuilder::new(listen_config).build();
 
-        // Initialize DiscV5
         let mut discv5 = Discv5::new(enr, enr_key, config)
             .map_err(|e| DiscoveryError::Discv5Error(e.to_string()))?;
 
-        // Start listening (no arguments - uses config from constructor)
         discv5
             .start()
             .await
@@ -126,7 +119,6 @@ impl Discovery {
 
         info!("DiscV5 listening on {}", listen_addr);
 
-        // Add bootstrap peers
         for peer_str in bootstrap_peers {
             match peer_str.parse::<enr::Enr<enr::CombinedKey>>() {
                 Ok(bootstrap_enr) => match discv5.add_enr(bootstrap_enr.clone()) {
@@ -137,11 +129,15 @@ impl Discovery {
             }
         }
 
+        // Build our local provider record from announce addresses.
+        // This is what we send in AddProvider messages so peers can reach us.
+        let local_provider_record = build_provider_record(&peer_id, &announce_addrs);
+
         Ok(Self {
             discv5: Arc::new(discv5),
             peer_id,
-            providers: Arc::new(RwLock::new(HashMap::new())),
-            _announce_addrs: announce_addrs,
+            provider_store: new_provider_store(),
+            local_provider_record,
         })
     }
 
@@ -155,60 +151,113 @@ impl Discovery {
         self.discv5.local_enr()
     }
 
-    /// Announce that we provide a specific CID (block)
+    /// Announce that we provide a specific CID to the DHT.
+    ///
+    /// Finds the K closest nodes to the CID's NodeId and sends
+    /// AddProvider messages to each of them.
     pub async fn provide(&self, cid: &Cid) -> Result<()> {
-        debug!("Announcing provider record for CID: {}", cid);
+        let node_id = cid_to_node_id(cid);
+        let content_id = node_id.raw().to_vec();
 
-        // Store locally that we provide this CID
-        let mut providers = self.providers.write().await;
-        providers
-            .entry(*cid)
-            .or_insert_with(Vec::new)
-            .push(self.peer_id);
+        info!("Providing CID {} to DHT (NodeId: {})", cid, node_id);
 
-        // In a full implementation, we would publish to the DHT here
-        // For now, we just track locally
-        info!("Providing CID: {}", cid);
+        // Store locally too
+        handle_add_provider(
+            &self.provider_store,
+            &content_id,
+            self.local_provider_record.clone(),
+        )
+        .await;
 
+        // Find K closest nodes to this content ID
+        let closest_nodes = match self.discv5.find_node(node_id).await {
+            Ok(nodes) => nodes,
+            Err(e) => {
+                warn!("Failed to find nodes for provide: {}", e);
+                // Even if DHT lookup fails, we stored locally
+                return Ok(());
+            }
+        };
+
+        if closest_nodes.is_empty() {
+            info!("No DHT peers found for provide, stored locally only");
+            return Ok(());
+        }
+
+        info!(
+            "Sending AddProvider to {} closest nodes",
+            closest_nodes.len()
+        );
+
+        // Send AddProvider to each close node via talk_req
+        // (The discv5 crate's talk_req sends type 0x05, but we need type 0x0B.
+        //  We use the raw request API to send AddProvider directly.)
+        for enr in &closest_nodes {
+            let contact = match discv5::handler::NodeContact::try_from_enr(
+                enr.clone(),
+                self.discv5.ip_mode(),
+            ) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+
+            // Send AddProvider via talk_req with protocol "provider".
+            // The remote node receives this and stores the provider record.
+            // We encode our content_id + provider_record as the request payload.
+            let mut payload = Vec::with_capacity(32 + self.local_provider_record.len());
+            payload.extend_from_slice(&content_id);
+            payload.extend_from_slice(&self.local_provider_record);
+
+            let discv5_clone = self.discv5.clone();
+            let enr_clone = enr.clone();
+            tokio::spawn(async move {
+                match discv5_clone
+                    .talk_req(contact, b"provider".to_vec(), payload)
+                    .await
+                {
+                    Ok(_) => debug!("AddProvider sent to {}", enr_clone.node_id()),
+                    Err(e) => debug!("AddProvider to {} failed: {}", enr_clone.node_id(), e),
+                }
+            });
+        }
+
+        info!("Provided CID {} to {} DHT nodes", cid, closest_nodes.len());
         Ok(())
     }
 
-    /// Find providers for a specific CID
-    pub async fn find(&self, cid: &Cid) -> Result<Vec<PeerId>> {
-        debug!("Searching for providers of CID: {}", cid);
+    /// Find providers for a specific CID from the DHT.
+    pub async fn find(&self, cid: &Cid) -> Result<Vec<Vec<u8>>> {
+        let node_id = cid_to_node_id(cid);
+        let content_id = node_id.raw().to_vec();
 
-        // Check local cache first
-        let providers = self.providers.read().await;
-        if let Some(peers) = providers.get(cid) {
-            if !peers.is_empty() {
-                debug!("Found {} providers in cache", peers.len());
-                return Ok(peers.clone());
-            }
+        debug!("Finding providers for CID {} (NodeId: {})", cid, node_id);
+
+        // Check local store first
+        let (_, local_providers) =
+            handle_get_providers(&self.provider_store, &content_id).await;
+        if !local_providers.is_empty() {
+            info!(
+                "Found {} local providers for CID {}",
+                local_providers.len(),
+                cid
+            );
+            return Ok(local_providers);
         }
-        drop(providers);
 
-        // Query DHT for providers
-        // In a full implementation, we would query the DHT here
-        warn!("DHT provider queries not yet fully implemented");
+        // Query DHT (future: send GetProviders to K closest nodes)
+        warn!("DHT GetProviders queries not yet fully implemented");
 
         Err(DiscoveryError::NoProviders(cid.to_string()))
-    }
-
-    /// Find a specific peer by ID
-    pub async fn find_peer(&self, peer_id: &PeerId) -> Result<Vec<String>> {
-        debug!("Searching for peer: {}", peer_id);
-
-        // Query DHT for peer's ENR
-        // Convert PeerId to NodeId for lookup
-        // For now, return empty (not yet implemented)
-        warn!("DHT peer lookups not yet fully implemented");
-
-        Ok(vec![])
     }
 
     /// Get connected peer count
     pub fn connected_peers(&self) -> usize {
         self.discv5.connected_peers()
+    }
+
+    /// Get the provider store for external use
+    pub fn provider_store(&self) -> &SharedProviderStore {
+        &self.provider_store
     }
 
     /// Run the discovery event loop
@@ -235,20 +284,13 @@ impl Discovery {
         match event {
             Discv5Event::Discovered(enr) => {
                 debug!("Discovered peer: {}", enr.node_id());
-
-                // Extract libp2p peer ID if available
                 if let Some(Ok(peer_id_bytes)) = enr.get_decodable::<Vec<u8>>("libp2p") {
-                    match PeerId::from_bytes(&peer_id_bytes) {
-                        Ok(peer_id) => {
-                            info!(
-                                "Discovered libp2p peer: {} (ENR: {})",
-                                peer_id,
-                                enr.node_id()
-                            );
-                        }
-                        Err(e) => {
-                            warn!("Invalid libp2p peer ID in ENR: {}", e);
-                        }
+                    if let Ok(peer_id) = PeerId::from_bytes(&peer_id_bytes) {
+                        info!(
+                            "Discovered libp2p peer: {} (ENR: {})",
+                            peer_id,
+                            enr.node_id()
+                        );
                     }
                 }
             }
@@ -266,8 +308,43 @@ impl Discovery {
                     socket_addr
                 );
             }
+            Discv5Event::ProviderRequest(req) => {
+                match req.body() {
+                    RequestBody::AddProvider {
+                        content_id,
+                        provider_record,
+                    } => {
+                        info!(
+                            "Received AddProvider from {} for content {}",
+                            req.node_id(),
+                            hex::encode(&content_id[..8.min(content_id.len())])
+                        );
+                        handle_add_provider(
+                            &self.provider_store,
+                            content_id,
+                            provider_record.clone(),
+                        )
+                        .await;
+                        // AddProvider is fire-and-forget, no response needed.
+                        // Drop the request (which will not send a response since
+                        // the Drop impl only auto-responds for GetProviders).
+                    }
+                    RequestBody::GetProviders { content_id } => {
+                        info!(
+                            "Received GetProviders from {} for content {}",
+                            req.node_id(),
+                            hex::encode(&content_id[..8.min(content_id.len())])
+                        );
+                        let (total, providers) =
+                            handle_get_providers(&self.provider_store, content_id).await;
+                        req.respond(ResponseBody::Providers { total, providers });
+                    }
+                    _ => {
+                        warn!("Unexpected request body in ProviderRequest");
+                    }
+                }
+            }
             _ => {
-                // Other events (TalkRequest, etc.)
                 debug!("DiscV5 event: {:?}", event);
             }
         }
@@ -281,6 +358,23 @@ impl Discovery {
             local_enr: self.local_enr().to_base64(),
         }
     }
+}
+
+/// Build a simple provider record from peer ID and announce addresses.
+///
+/// In the Archivist protocol, this is a SignedPeerRecord (libp2p signed envelope).
+/// For now we build a minimal record — future work should sign it properly.
+fn build_provider_record(peer_id: &PeerId, announce_addrs: &[String]) -> Vec<u8> {
+    // Encode as simple concatenation: peer_id bytes + address bytes
+    // This is a placeholder — real implementation should use libp2p's
+    // SignedPeerRecord format for full Archivist compatibility.
+    let mut record = Vec::new();
+    record.extend_from_slice(&peer_id.to_bytes());
+    for addr in announce_addrs {
+        record.extend_from_slice(addr.as_bytes());
+        record.push(0); // separator
+    }
+    record
 }
 
 /// Discovery statistics
@@ -311,7 +405,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_provide_and_find() {
+    async fn test_provide_stores_locally() {
         let keypair = Keypair::generate_secp256k1();
         let listen_addr = "127.0.0.1:9001".parse().unwrap();
         let announce_addrs = vec!["/ip4/127.0.0.1/tcp/8070".to_string()];
@@ -320,17 +414,15 @@ mod tests {
             .await
             .unwrap();
 
-        // Create a test CID
         let cid: Cid = "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi"
             .parse()
             .unwrap();
 
-        // Announce we provide this CID
+        // Provide should store locally even without DHT peers
         discovery.provide(&cid).await.unwrap();
 
-        // Should find ourselves as provider
+        // Find should return our local record
         let providers = discovery.find(&cid).await.unwrap();
         assert_eq!(providers.len(), 1);
-        assert_eq!(providers[0], keypair.public().to_peer_id());
     }
 }

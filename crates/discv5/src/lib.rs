@@ -116,7 +116,7 @@ extern crate lazy_static;
 
 pub type Enr = enr::Enr<enr::CombinedKey>;
 
-pub use crate::discv5::{Discv5, Event};
+pub use crate::discv5::{Discv5, Event, ProviderRequest};
 pub use config::{Config, ConfigBuilder};
 pub use error::{Error, QueryError, RequestError, ResponseError};
 pub use executor::{Executor, TokioExecutor};

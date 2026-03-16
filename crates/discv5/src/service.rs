@@ -679,8 +679,14 @@ impl Service {
 
                 self.send_event(Event::TalkRequest(req));
             }
-            RequestBody::AddProvider { .. } | RequestBody::GetProviders { .. } => {
-                debug!(%node_address, "Received provider request (not yet handled)");
+            body @ (RequestBody::AddProvider { .. } | RequestBody::GetProviders { .. }) => {
+                let req = crate::discv5::ProviderRequest {
+                    id,
+                    node_address: node_address.clone(),
+                    body,
+                    sender: Some(self.handler_send.clone()),
+                };
+                self.send_event(Event::ProviderRequest(req));
             }
         }
     }

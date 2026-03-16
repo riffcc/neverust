@@ -232,6 +232,7 @@ pub async fn run_node(config: Config) -> Result<(), P2PError> {
         };
 
     // Start DiscV5 event loop in background when discovery is available.
+    let discovery_ref = discovery.clone();
     if let Some(discovery) = discovery {
         tokio::spawn(async move {
             info!("Starting DiscV5 event loop");
@@ -516,10 +517,18 @@ pub async fn run_node(config: Config) -> Result<(), P2PError> {
                                             data.len()
                                         );
 
-                                        // Block is automatically stored by BlockExcBehaviour
-                                        // Pending request is automatically completed by BlockExcBehaviour
-                                        // Just track metrics here
                                         metrics.block_received(data.len());
+
+                                        // Auto-provide the block to the DHT
+                                        if let Some(ref disc) = discovery_ref {
+                                            let disc = disc.clone();
+                                            let cid_clone = cid;
+                                            tokio::spawn(async move {
+                                                if let Err(e) = disc.provide(&cid_clone).await {
+                                                    warn!("Failed to provide block to DHT: {}", e);
+                                                }
+                                            });
+                                        }
                                     }
                                     BlockExcToBehaviour::BlockPresence { cid, has_block } => {
                                         info!(

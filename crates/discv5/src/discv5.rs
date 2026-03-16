@@ -14,11 +14,13 @@
 
 use crate::{
     error::{Error, QueryError, RequestError},
+    handler,
     kbucket::{
         self, ConnectionDirection, ConnectionState, FailureReason, InsertResult, KBucketsTable,
         NodeStatus, UpdateResult,
     },
     node_info::{NodeAddress, NodeContact},
+    rpc,
     service::{QueryKind, Service, ServiceRequest, TalkRequest},
     Config, Enr, IpMode,
 };
@@ -78,6 +80,81 @@ pub enum Event {
     SocketUpdated(SocketAddr),
     /// A node has initiated a talk request.
     TalkRequest(TalkRequest),
+    /// A node has sent an AddProvider or GetProviders request.
+    ProviderRequest(ProviderRequest),
+}
+
+/// An inbound AddProvider or GetProviders request from a peer.
+pub struct ProviderRequest {
+    pub(crate) id: rpc::RequestId,
+    pub(crate) node_address: NodeAddress,
+    pub(crate) body: rpc::RequestBody,
+    pub(crate) sender: Option<mpsc::UnboundedSender<handler::HandlerIn>>,
+}
+
+impl ProviderRequest {
+    /// Get the request ID.
+    pub fn id(&self) -> &rpc::RequestId {
+        &self.id
+    }
+
+    /// Get the node ID of the sender.
+    pub fn node_id(&self) -> &NodeId {
+        &self.node_address.node_id
+    }
+
+    /// Get the request body.
+    pub fn body(&self) -> &rpc::RequestBody {
+        &self.body
+    }
+
+    /// Send a Providers response back to the requester.
+    pub fn respond(mut self, response_body: rpc::ResponseBody) {
+        if let Some(sender) = self.sender.take() {
+            let response = rpc::Response {
+                id: self.id.clone(),
+                body: response_body,
+            };
+            if let Err(e) = sender.send(handler::HandlerIn::Response(
+                self.node_address.clone(),
+                Box::new(response),
+            )) {
+                warn!(error = %e, "Failed to send provider response");
+            }
+        }
+    }
+}
+
+impl Drop for ProviderRequest {
+    fn drop(&mut self) {
+        // For AddProvider requests, no response is needed (fire-and-forget).
+        // For GetProviders, if respond() wasn't called, send empty providers.
+        if let Some(sender) = self.sender.take() {
+            if matches!(self.body, rpc::RequestBody::GetProviders { .. }) {
+                let response = rpc::Response {
+                    id: self.id.clone(),
+                    body: rpc::ResponseBody::Providers {
+                        total: 0,
+                        providers: vec![],
+                    },
+                };
+                let _ = sender.send(handler::HandlerIn::Response(
+                    self.node_address.clone(),
+                    Box::new(response),
+                ));
+            }
+        }
+    }
+}
+
+impl std::fmt::Debug for ProviderRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProviderRequest")
+            .field("id", &self.id)
+            .field("node_address", &self.node_address)
+            .field("body", &self.body)
+            .finish()
+    }
 }
 
 /// The main Discv5 Service struct. This provides the user-level API for performing queries and
