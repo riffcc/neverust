@@ -583,6 +583,7 @@ mod tests {
             prover: true,
             log_level: "debug".to_string(),
             bootstrap_node: vec!["/ip4/1.2.3.4/tcp/8070/p2p/12D3KooTest".to_string()],
+            announce_addr: vec![],
             citadel_mode: true,
             citadel_site_id: 42,
             citadel_node_id: 7,

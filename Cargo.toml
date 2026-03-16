@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "neverust-core",
+    "crates/discv5",
 ]
 resolver = "2"
 

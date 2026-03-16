@@ -2022,6 +2022,7 @@ mod tests {
                 eth_account: Some("0xabc".to_string()),
                 ..MarketplaceRuntimeInfo::default()
             },
+            Vec::new(),
         );
 
         (app, tmp)
