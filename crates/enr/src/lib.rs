@@ -288,10 +288,10 @@ impl<K: EnrKey> Enr<K> {
     ) -> Result<Self, Error> {
         use alloy_rlp::Encodable;
 
-        let verifying_key = k256::ecdsa::VerifyingKey::from_sec1_bytes(secp256k1_pubkey)
-            .map_err(|_| Error::SigningError)?;
-        let public_key = CombinedPublicKey::Secp256k1(verifying_key);
-        let node_id = NodeId::from(public_key);
+        // Archivist derives NodeId from the PeerId, which is:
+        //   keccak256(multihash(identity, protobuf_encoded_pubkey))
+        // where protobuf_encoded_pubkey = {field 1: key_type=Secp256k1(1), field 2: compressed_key}
+        let node_id = archivist_node_id_from_secp256k1(secp256k1_pubkey)?;
 
         let mut content = BTreeMap::new();
 
@@ -1307,6 +1307,38 @@ impl<K: EnrKey> IntoIterator for Enr<K> {
             inner: self.content.into_iter(),
         }
     }
+}
+
+/// Derive an Archivist-compatible NodeId from a secp256k1 compressed public key.
+///
+/// Archivist computes NodeId as: keccak256(PeerId.data) where PeerId.data is a
+/// multihash(identity, protobuf_encoded_pubkey). The protobuf_encoded_pubkey is:
+///   field 1 (varint): key_type = 1 (Secp256k1)
+///   field 2 (length-delimited): compressed 33-byte key
+pub fn archivist_node_id_from_secp256k1(compressed_pubkey: &[u8]) -> Result<NodeId, Error> {
+    if compressed_pubkey.len() != 33 {
+        return Err(Error::SigningError);
+    }
+
+    // Build the protobuf-encoded public key: {field 1: type=2(Secp256k1), field 2: key_bytes}
+    // field 1 (varint, field_num=1, wire_type=0): key = 0x08, value = 0x02
+    // field 2 (length-delimited, field_num=2, wire_type=2): key = 0x12, length = 33, data = compressed_key
+    let mut proto_pubkey = Vec::with_capacity(2 + 1 + 1 + 33);
+    proto_pubkey.push(0x08); // field 1, varint
+    proto_pubkey.push(0x02); // Secp256k1 = 2 (RSA=0, Ed25519=1, Secp256k1=2, ECDSA=3)
+    proto_pubkey.push(0x12); // field 2, length-delimited
+    proto_pubkey.push(33);   // length of compressed key
+    proto_pubkey.extend_from_slice(compressed_pubkey);
+
+    // Identity multihash: code=0x00, length=proto_pubkey.len(), data=proto_pubkey
+    let mut peer_id_bytes = Vec::with_capacity(2 + proto_pubkey.len());
+    peer_id_bytes.push(0x00); // identity hash function code
+    peer_id_bytes.push(proto_pubkey.len() as u8); // length (fits in 1 byte for 37 bytes)
+    peer_id_bytes.extend_from_slice(&proto_pubkey);
+
+    // keccak256 of the PeerId bytes
+    let hash = digest(&peer_id_bytes);
+    Ok(NodeId::parse(&hash).expect("always 32 bytes"))
 }
 
 pub(crate) fn digest(b: &[u8]) -> [u8; 32] {

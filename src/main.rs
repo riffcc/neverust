@@ -41,7 +41,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
 fn init_logging(level: &str) {
     tracing_subscriber::registry()
-        .with(tracing_subscriber::EnvFilter::new(level))
+        .with(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(level)),
+        )
         .with(tracing_subscriber::fmt::layer())
         .init();
 }

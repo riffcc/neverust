@@ -475,7 +475,8 @@ fn enr_from_spr_bytes(spr_bytes: &[u8]) -> Option<Enr<CombinedKey>> {
         }
     }
 
-    if key_type != 1 {
+    // Secp256k1 = 2 in libp2p's protobuf KeyType enum
+    if key_type != 2 {
         debug!("SPR has non-secp256k1 key type: {}", key_type);
         return None;
     }
