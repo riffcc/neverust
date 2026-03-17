@@ -153,8 +153,8 @@ impl Discovery {
             }
         }
 
-        // Build our local provider record from announce addresses.
-        let local_provider_record = build_provider_record(&peer_id, &announce_addrs);
+        // Build our local provider record (libp2p SignedPeerRecord) from keypair + announce addresses.
+        let local_provider_record = build_provider_record(keypair, &announce_addrs);
 
         Ok(Self {
             discv5: discv5_arc,
@@ -420,32 +420,18 @@ async fn bootstrap_from_spr(
 
     let socket_addr = udp_addr.ok_or_else(|| "No UDP address found in SPR".to_string())?;
 
-    // Create a synthetic ENR for the bootstrap node using their public key
-    let verifying_key = enr::k256::ecdsa::VerifyingKey::from_sec1_bytes(pubkey_bytes)
-        .map_err(|e| format!("Invalid secp256k1 key: {}", e))?;
-    let public_key = enr::CombinedPublicKey::Secp256k1(verifying_key);
+    // Build ENR from the SPR's verified public key — this gives us the correct
+    // NodeId (keccak256 of the uncompressed secp256k1 key), matching what the
+    // Archivist node uses as its own identity in the DHT.
+    let (ip4, udp4) = match socket_addr {
+        SocketAddr::V4(v4) => (Some(*v4.ip()), Some(v4.port())),
+        _ => (None, None),
+    };
+    let bootstrap_enr =
+        enr::Enr::<enr::CombinedKey>::from_verified_spr(pubkey_bytes, 1, ip4, udp4, None)
+            .map_err(|e| format!("Failed to build ENR from SPR: {:?}", e))?;
 
-    // Build ENR for the bootstrap node (signed by our key, which is technically
-    // wrong, but we only need it for the routing table entry with correct NodeId)
-    let enr_key =
-        enr::CombinedKey::Secp256k1(enr::k256::ecdsa::SigningKey::random(&mut rand::thread_rng()));
-    let mut builder = enr::Enr::builder();
-    match socket_addr.ip() {
-        IpAddr::V4(ip) => {
-            builder.ip4(ip);
-            builder.udp4(socket_addr.port());
-        }
-        IpAddr::V6(ip) => {
-            builder.ip6(ip);
-            builder.udp6(socket_addr.port());
-        }
-    }
-    let bootstrap_enr = builder
-        .build(&enr_key)
-        .map_err(|e| format!("Failed to build bootstrap ENR: {}", e))?;
-
-    // The NodeId is derived from the public key hash
-    let node_id = enr::NodeId::from(public_key);
+    let node_id = bootstrap_enr.node_id();
 
     info!(
         "Bootstrapping DiscV5 from SPR: {} at {} (NodeId: {})",
@@ -502,21 +488,28 @@ async fn bootstrap_from_spr(
     Ok(())
 }
 
-/// Build a simple provider record from peer ID and announce addresses.
+/// Build a proper libp2p SignedPeerRecord for provider announcements.
 ///
-/// In the Archivist protocol, this is a SignedPeerRecord (libp2p signed envelope).
-/// For now we build a minimal record — future work should sign it properly.
-fn build_provider_record(peer_id: &PeerId, announce_addrs: &[String]) -> Vec<u8> {
-    // Encode as simple concatenation: peer_id bytes + address bytes
-    // This is a placeholder — real implementation should use libp2p's
-    // SignedPeerRecord format for full Archivist compatibility.
-    let mut record = Vec::new();
-    record.extend_from_slice(&peer_id.to_bytes());
-    for addr in announce_addrs {
-        record.extend_from_slice(addr.as_bytes());
-        record.push(0); // separator
-    }
-    record
+/// This is the format Archivist expects in AddProvider messages: a
+/// protobuf-encoded SignedEnvelope containing a PeerRecord with our
+/// peer ID and announce addresses.
+fn build_provider_record(
+    keypair: &libp2p::identity::Keypair,
+    announce_addrs: &[String],
+) -> Vec<u8> {
+    use libp2p::core::{PeerRecord, SignedEnvelope};
+    use libp2p::Multiaddr;
+
+    let peer_id = keypair.public().to_peer_id();
+    let addrs: Vec<Multiaddr> = announce_addrs
+        .iter()
+        .filter_map(|a| a.parse().ok())
+        .collect();
+
+    let peer_record = PeerRecord::new(keypair, addrs)
+        .expect("Failed to create PeerRecord");
+    let envelope = peer_record.into_signed_envelope();
+    envelope.into_protobuf_encoding()
 }
 
 /// Discovery statistics
