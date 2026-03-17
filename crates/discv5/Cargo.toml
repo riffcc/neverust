@@ -87,7 +87,7 @@ version = "0.9"
 version = "0.4"
 
 [dependencies.enr]
-version = "0.13.0"
+path = "../enr"
 features = [
     "k256",
     "ed25519",

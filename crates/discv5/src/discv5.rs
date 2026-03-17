@@ -672,6 +672,29 @@ impl Discv5 {
         }
     }
 
+    /// Send an AddProvider message to a specific node (fire-and-forget).
+    pub fn send_add_provider(
+        &self,
+        node_contact: NodeContact,
+        content_id: Vec<u8>,
+        provider_record: Vec<u8>,
+    ) -> impl Future<Output = Result<(), RequestError>> + 'static {
+        let channel = self.clone_channel();
+
+        async move {
+            let channel = channel.map_err(|_| RequestError::ServiceNotStarted)?;
+
+            let event = ServiceRequest::AddProvider(node_contact, content_id, provider_record);
+
+            channel
+                .send(event)
+                .await
+                .map_err(|_| RequestError::ChannelFailed("Service channel closed".into()))?;
+
+            Ok(())
+        }
+    }
+
     /// Send a FINDNODE request for nodes that fall within the given set of distances,
     /// to the designated peer and wait for a response.
     pub fn find_node_designated_peer(

@@ -302,6 +302,7 @@ pub async fn run_node(config: Config) -> Result<(), P2PError> {
         prover: config.prover,
     };
     let api_announce_addrs = config.announce_addrs.clone();
+    let api_discovery = discovery_ref.clone();
     tokio::spawn(async move {
         let app = api::create_router_with_runtime(
             api_block_store,
@@ -314,6 +315,7 @@ pub async fn run_node(config: Config) -> Result<(), P2PError> {
             api_marketplace,
             api_marketplace_info,
             api_announce_addrs,
+            api_discovery,
         );
         let addr = format!("{}:{}", api_bind, api_port);
         info!("Starting REST API on {}", addr);

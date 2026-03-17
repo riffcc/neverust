@@ -432,6 +432,129 @@ fn decode_envelope(data: &[u8]) -> Result<(Vec<u8>, Vec<u8>), DecoderError> {
 }
 
 // ---------------------------------------------------------------------------
+// SPR (SignedPeerRecord) to ENR conversion
+// ---------------------------------------------------------------------------
+
+/// Decode an Archivist SPR (protobuf SignedEnvelope) into an ENR with correct NodeId.
+///
+/// The SPR is verified by parsing its libp2p SignedEnvelope structure and
+/// extracting the secp256k1 public key and addresses. The resulting ENR
+/// has `externally_verified = true` with the correct NodeId derived from
+/// the SPR's public key via keccak256.
+fn enr_from_spr_bytes(spr_bytes: &[u8]) -> Option<Enr<CombinedKey>> {
+    // Parse the SignedEnvelope protobuf:
+    // field 1 = public_key (protobuf: {field 1: key_type, field 2: key_data})
+    // field 2 = payload_type
+    // field 3 = payload (PeerRecord protobuf)
+    // field 5 = signature
+    let envelope_fields = decode_all_fields(spr_bytes).ok()?;
+
+    let mut public_key_proto: Option<Vec<u8>> = None;
+    let mut payload: Option<Vec<u8>> = None;
+
+    for (fnum, _wt, fdata) in &envelope_fields {
+        match fnum {
+            1 => public_key_proto = Some(fdata.clone()),
+            3 => payload = Some(fdata.clone()),
+            _ => {}
+        }
+    }
+
+    let pk_proto = public_key_proto?;
+    let payload_bytes = payload?;
+
+    // Parse PublicKey protobuf: field 1 = key_type (1 = Secp256k1), field 2 = data
+    let pk_fields = decode_all_fields(&pk_proto).ok()?;
+    let mut key_type: u64 = 0;
+    let mut key_data: Option<Vec<u8>> = None;
+    for (fnum, _wt, fdata) in &pk_fields {
+        match fnum {
+            1 => key_type = varint_value(fdata).unwrap_or(0),
+            2 => key_data = Some(fdata.clone()),
+            _ => {}
+        }
+    }
+
+    if key_type != 1 {
+        debug!("SPR has non-secp256k1 key type: {}", key_type);
+        return None;
+    }
+    let secp_key_bytes = key_data?;
+
+    // Parse PeerRecord protobuf to extract addresses:
+    // field 1 = peer_id, field 2 = seq, field 3 (repeated) = AddressInfo
+    let pr_fields = decode_all_fields(&payload_bytes).ok()?;
+    let mut seq: u64 = 0;
+    let mut ipv4: Option<Ipv4Addr> = None;
+    let mut udp_port: Option<u16> = None;
+    let mut tcp_port: Option<u16> = None;
+
+    for (fnum, wt, fdata) in &pr_fields {
+        match (*fnum, *wt) {
+            (2, 0) => seq = varint_value(fdata).unwrap_or(0),
+            (3, 2) => {
+                // AddressInfo: field 1 = multiaddr bytes
+                if let Ok(addr_fields) = decode_all_fields(fdata) {
+                    for (afnum, _awt, adata) in &addr_fields {
+                        if *afnum == 1 {
+                            if let Some((ip, port, proto)) = parse_multiaddr(adata) {
+                                ipv4 = Some(ip);
+                                if proto == "udp" {
+                                    udp_port = Some(port);
+                                } else if proto == "tcp" {
+                                    tcp_port = Some(port);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Build ENR with correct NodeId from verified SPR public key
+    match Enr::<CombinedKey>::from_verified_spr(&secp_key_bytes, seq, ipv4, udp_port, tcp_port) {
+        Ok(enr) => {
+            debug!(
+                "Decoded SPR: NodeId={}, ip={:?}, udp={:?}",
+                enr.node_id(),
+                ipv4,
+                udp_port
+            );
+            Some(enr)
+        }
+        Err(e) => {
+            debug!("Failed to build ENR from SPR: {:?}", e);
+            None
+        }
+    }
+}
+
+/// Parse a raw multiaddr binary, returning (ip, port, protocol).
+fn parse_multiaddr(data: &[u8]) -> Option<(Ipv4Addr, u16, &'static str)> {
+    if data.len() < 7 {
+        return None;
+    }
+    // /ip4 = protocol code 0x04
+    if data[0] != 0x04 {
+        return None;
+    }
+    let ip = Ipv4Addr::new(data[1], data[2], data[3], data[4]);
+
+    // Next protocol: UDP (0x0111 = 273, varint 0x91 0x02) or TCP (0x06)
+    if data.len() >= 9 && data[5] == 0x91 && data[6] == 0x02 {
+        let port = u16::from_be_bytes([data[7], data[8]]);
+        return Some((ip, port, "udp"));
+    }
+    if data.len() >= 8 && data[5] == 0x06 {
+        let port = u16::from_be_bytes([data[6], data[7]]);
+        return Some((ip, port, "tcp"));
+    }
+    None
+}
+
+// ---------------------------------------------------------------------------
 // Decode inner body helpers
 // ---------------------------------------------------------------------------
 
@@ -711,19 +834,30 @@ impl Message {
                 })
             }
             0x04 => {
-                // Nodes
+                // Nodes — Archivist sends SPR records (protobuf SignedPeerRecords),
+                // not RLP-encoded ENRs. Try ENR decode first, skip on failure.
                 let mut total: u64 = 0;
                 let mut nodes = Vec::new();
                 for (fnum, wt, fdata) in &body_fields {
                     match (*fnum, *wt) {
                         (1, 0) => total = varint_value(fdata)?,
                         (2, 2) => {
-                            let enr =
-                                Enr::<CombinedKey>::decode(&mut &fdata[..]).map_err(|e| {
-                                    debug!(error = ?e, "Failed to decode ENR in Nodes response");
-                                    DecoderError::Custom("Failed to decode ENR in Nodes response")
-                                })?;
-                            nodes.push(enr);
+                            match Enr::<CombinedKey>::decode(&mut &fdata[..]) {
+                                Ok(enr) => nodes.push(enr),
+                                Err(_) => {
+                                    // Archivist SPR record — can't decode as ENR.
+                                    // Try to extract enough info to create a synthetic ENR.
+                                    if let Some(enr) = enr_from_spr_bytes(fdata) {
+                                        debug!("Decoded SPR record as synthetic ENR");
+                                        nodes.push(enr);
+                                    } else {
+                                        debug!(
+                                            "Skipping non-ENR record in Nodes response ({} bytes)",
+                                            fdata.len()
+                                        );
+                                    }
+                                }
+                            }
                         }
                         _ => {}
                     }

@@ -265,6 +265,7 @@ pub struct ApiState {
     pub keypair: Arc<Keypair>,
     pub listen_addrs: Arc<RwLock<Vec<Multiaddr>>>,
     pub announce_addrs: Vec<String>,
+    pub discovery: Option<Arc<crate::discovery::Discovery>>,
     pub fallback_http_peers: Arc<Vec<String>>,
     pub fallback_http_client: reqwest::Client,
     pub ipfs_cluster_pins: Arc<AsyncRwLock<HashMap<String, IpfsClusterPinRecord>>>,
@@ -409,6 +410,7 @@ pub fn create_router(
         None,
         MarketplaceRuntimeInfo::default(),
         Vec::new(),
+        None,
     )
 }
 
@@ -433,6 +435,7 @@ pub fn create_router_with_citadel(
         None,
         MarketplaceRuntimeInfo::default(),
         Vec::new(),
+        None,
     )
 }
 
@@ -448,6 +451,7 @@ pub fn create_router_with_runtime(
     marketplace: Option<MarketplaceStore>,
     marketplace_runtime: MarketplaceRuntimeInfo,
     announce_addrs: Vec<String>,
+    discovery: Option<Arc<crate::discovery::Discovery>>,
 ) -> Router {
     let fallback_http_peers = Arc::new(fallback_http_peer_urls());
     let fallback_http_client = reqwest::Client::builder()
@@ -463,6 +467,7 @@ pub fn create_router_with_runtime(
         keypair,
         listen_addrs,
         announce_addrs,
+        discovery,
         fallback_http_peers,
         fallback_http_client,
         ipfs_cluster_pins: Arc::new(AsyncRwLock::new(HashMap::new())),
@@ -1748,6 +1753,17 @@ async fn archivist_upload(State(state): State<ApiState>, body: Body) -> Result<S
         dataset_size
     );
 
+    // Auto-provide to DHT
+    if let Some(ref disc) = state.discovery {
+        let disc = disc.clone();
+        let cid = manifest_cid;
+        tokio::spawn(async move {
+            if let Err(e) = disc.provide(&cid).await {
+                tracing::warn!("Failed to provide uploaded CID to DHT: {}", e);
+            }
+        });
+    }
+
     // Return manifest CID as plain text (Archivist format with base58btc encoding)
     Ok(cid_to_string(&manifest_cid))
 }
@@ -2023,6 +2039,7 @@ mod tests {
                 ..MarketplaceRuntimeInfo::default()
             },
             Vec::new(),
+            None,
         );
 
         (app, tmp)

@@ -192,20 +192,32 @@ impl Discovery {
         )
         .await;
 
-        // Find K closest nodes to this content ID
+        // Find K closest nodes to this content ID.
+        // If find_node returns no peers, fall back to all known table entries.
         let closest_nodes = match self.discv5.find_node(node_id).await {
-            Ok(nodes) => nodes,
+            Ok(nodes) if !nodes.is_empty() => nodes,
+            Ok(_) => {
+                // No peers from find_node — use all routing table entries as fallback
+                let table_entries = self.discv5.table_entries_enr();
+                if table_entries.is_empty() {
+                    info!("No DHT peers available for provide, stored locally only");
+                    return Ok(());
+                }
+                info!(
+                    "find_node returned 0 peers, using {} routing table entries",
+                    table_entries.len()
+                );
+                table_entries
+            }
             Err(e) => {
                 warn!("Failed to find nodes for provide: {}", e);
-                // Even if DHT lookup fails, we stored locally
-                return Ok(());
+                let table_entries = self.discv5.table_entries_enr();
+                if table_entries.is_empty() {
+                    return Ok(());
+                }
+                table_entries
             }
         };
-
-        if closest_nodes.is_empty() {
-            info!("No DHT peers found for provide, stored locally only");
-            return Ok(());
-        }
 
         info!(
             "Sending AddProvider to {} closest nodes",
@@ -224,21 +236,17 @@ impl Discovery {
                 Err(_) => continue,
             };
 
-            // Send AddProvider via talk_req with protocol "provider".
-            // The remote node receives this and stores the provider record.
-            // We encode our content_id + provider_record as the request payload.
-            let mut payload = Vec::with_capacity(32 + self.local_provider_record.len());
-            payload.extend_from_slice(&content_id);
-            payload.extend_from_slice(&self.local_provider_record);
-
+            // Send AddProvider (0x0B) directly via the discv5 service.
             let discv5_clone = self.discv5.clone();
+            let cid_clone = content_id.clone();
+            let record_clone = self.local_provider_record.clone();
             let enr_clone = enr.clone();
             tokio::spawn(async move {
                 match discv5_clone
-                    .talk_req(contact, b"provider".to_vec(), payload)
+                    .send_add_provider(contact, cid_clone, record_clone)
                     .await
                 {
-                    Ok(_) => debug!("AddProvider sent to {}", enr_clone.node_id()),
+                    Ok(()) => info!("AddProvider sent to {}", enr_clone.node_id()),
                     Err(e) => debug!("AddProvider to {} failed: {}", enr_clone.node_id(), e),
                 }
             });

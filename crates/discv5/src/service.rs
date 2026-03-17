@@ -164,6 +164,8 @@ pub enum ServiceRequest {
     ),
     /// The PING discv5 RPC function.
     Ping(Enr, Option<oneshot::Sender<Result<Pong, RequestError>>>),
+    /// Send an AddProvider message (fire-and-forget, no response expected).
+    AddProvider(NodeContact, Vec<u8>, Vec<u8>),
     /// Sets up an event stream where the discv5 server will return various events such as
     /// discovered nodes as it traverses the DHT.
     RequestEventStream(oneshot::Sender<mpsc::Receiver<Event>>),
@@ -355,6 +357,9 @@ impl Service {
                         }
                         ServiceRequest::Talk(node_contact, protocol, request, callback) => {
                             self.talk_request(node_contact, protocol, request, callback);
+                        }
+                        ServiceRequest::AddProvider(contact, content_id, provider_record) => {
+                            self.send_add_provider(contact, content_id, provider_record);
                         }
                         ServiceRequest::Ping(enr, callback) => {
                             self.send_ping(enr, callback);
@@ -1070,6 +1075,27 @@ impl Service {
             request_body,
             query_id: None,
             callback: Some(CallbackResponse::Talk(callback)),
+        };
+        self.send_rpc_request(active_request);
+    }
+
+    /// Sends an AddProvider message (fire-and-forget, no response expected).
+    fn send_add_provider(
+        &mut self,
+        contact: NodeContact,
+        content_id: Vec<u8>,
+        provider_record: Vec<u8>,
+    ) {
+        let request_body = RequestBody::AddProvider {
+            content_id,
+            provider_record,
+        };
+
+        let active_request = ActiveRequest {
+            contact,
+            request_body,
+            query_id: None,
+            callback: None,
         };
         self.send_rpc_request(active_request);
     }

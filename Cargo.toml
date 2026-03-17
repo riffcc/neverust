@@ -2,6 +2,7 @@
 members = [
     "neverust-core",
     "crates/discv5",
+    "crates/enr",
 ]
 resolver = "2"
 
