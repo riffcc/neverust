@@ -695,6 +695,33 @@ impl Discv5 {
         }
     }
 
+    /// Send a GetProviders request to a specific node and await the provider records.
+    pub fn get_providers(
+        &self,
+        enr: Enr,
+        content_id: Vec<u8>,
+    ) -> impl Future<Output = Result<(u32, Vec<Vec<u8>>), RequestError>> + 'static {
+        let (callback_send, callback_recv) = oneshot::channel();
+        let channel = self.clone_channel();
+        let ip_mode = self.ip_mode;
+
+        async move {
+            let node_contact = NodeContact::try_from_enr(enr, ip_mode)?;
+            let channel = channel.map_err(|_| RequestError::ServiceNotStarted)?;
+
+            let event = ServiceRequest::GetProviders(node_contact, content_id, callback_send);
+
+            channel
+                .send(event)
+                .await
+                .map_err(|_| RequestError::ChannelFailed("Service channel closed".into()))?;
+
+            callback_recv
+                .await
+                .map_err(|e| RequestError::ChannelFailed(e.to_string()))?
+        }
+    }
+
     /// Send a FINDNODE request for nodes that fall within the given set of distances,
     /// to the designated peer and wait for a response.
     pub fn find_node_designated_peer(

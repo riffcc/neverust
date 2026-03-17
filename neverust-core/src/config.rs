@@ -114,7 +114,8 @@ pub struct StartCommand {
     #[arg(long, default_value = "info")]
     pub log_level: String,
 
-    /// Bootstrap node multiaddr (can be specified multiple times)
+    /// Bootstrap node for peer connections or discovery.
+    /// Supports libp2p multiaddrs for TCP dialing and `spr:` / `enr:` entries for DiscV5.
     #[arg(long)]
     pub bootstrap_node: Vec<String>,
 
@@ -507,6 +508,104 @@ impl Config {
         tracing::info!("DiscV5: No bootstrap ENRs configured (will rely on local discovery)");
         Ok(vec![])
     }
+
+    /// Fetch DiscV5 bootstrap records.
+    ///
+    /// DiscV5 needs discovery-native bootstrap material such as Archivist
+    /// `spr:` records or ENRs. Libp2p TCP multiaddrs are not sufficient.
+    pub async fn fetch_discv5_bootstrap_nodes() -> Result<Vec<String>, ConfigError> {
+        if let Ok(bootstrap_node) = std::env::var("BOOTSTRAP_NODE") {
+            let url = format!("http://{}/api/archivist/v1/spr", bootstrap_node);
+            tracing::info!(
+                "Fetching DiscV5 bootstrap SPR from BOOTSTRAP_NODE env via {}",
+                url
+            );
+
+            match reqwest::get(&url).await {
+                Ok(response) if response.status().is_success() => {
+                    let body = response
+                        .text()
+                        .await
+                        .map_err(|e| ConfigError::Io(std::io::Error::other(e.to_string())))?;
+                    let bootstrap_nodes = Self::extract_discv5_bootstrap_nodes(&body);
+                    if !bootstrap_nodes.is_empty() {
+                        tracing::info!(
+                            "Resolved {} DiscV5 bootstrap record(s) from local bootstrap node",
+                            bootstrap_nodes.len()
+                        );
+                        return Ok(bootstrap_nodes);
+                    }
+                    tracing::warn!(
+                        "Bootstrap SPR endpoint returned no DiscV5 bootstrap records; falling back to testnet"
+                    );
+                }
+                Ok(response) => {
+                    tracing::warn!(
+                        "Bootstrap SPR endpoint returned non-success status {} for {}; falling back to testnet",
+                        response.status(),
+                        url
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to fetch DiscV5 bootstrap SPR from {}: {}; falling back to testnet",
+                        url,
+                        e
+                    );
+                }
+            }
+        }
+
+        let response = reqwest::get("https://spr.archivist.storage/testnet")
+            .await
+            .map_err(|e| ConfigError::Io(std::io::Error::other(e.to_string())))?
+            .text()
+            .await
+            .map_err(|e| ConfigError::Io(std::io::Error::other(e.to_string())))?;
+
+        let bootstrap_nodes = Self::extract_discv5_bootstrap_nodes(&response);
+        if bootstrap_nodes.is_empty() {
+            return Err(ConfigError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "No DiscV5 bootstrap records found in Archivist testnet SPR response",
+            )));
+        }
+
+        Ok(bootstrap_nodes)
+    }
+
+    /// Keep only discovery-native bootstrap entries that DiscV5 can consume.
+    pub fn filter_discv5_bootstrap_nodes(nodes: &[String]) -> Vec<String> {
+        let mut filtered = Vec::new();
+
+        for node in nodes {
+            let trimmed = node.trim();
+            if trimmed.starts_with("spr:") || trimmed.starts_with("enr:") {
+                filtered.push(trimmed.to_string());
+            } else if trimmed.starts_with('/') {
+                tracing::warn!(
+                    "Bootstrap node {} is a libp2p multiaddr; it can be dialed by the swarm but cannot bootstrap DiscV5. Provide an SPR (`spr:`) or ENR (`enr:`) for discovery bootstrapping.",
+                    trimmed
+                );
+            } else if !trimmed.is_empty() {
+                tracing::warn!(
+                    "Bootstrap node {} is not a supported DiscV5 bootstrap format; expected `spr:` or `enr:`.",
+                    trimmed
+                );
+            }
+        }
+
+        filtered
+    }
+
+    fn extract_discv5_bootstrap_nodes(response: &str) -> Vec<String> {
+        response
+            .lines()
+            .map(str::trim)
+            .filter(|line| line.starts_with("spr:") || line.starts_with("enr:"))
+            .map(ToString::to_string)
+            .collect()
+    }
 }
 
 impl From<StartCommand> for Config {
@@ -619,5 +718,27 @@ mod tests {
         assert_eq!(config.citadel_host_id, Some(2));
         assert_eq!(config.citadel_trusted_origins, vec![1, 2, 3]);
         assert_eq!(config.citadel_idle_bandwidth_kib, 64);
+    }
+
+    #[test]
+    fn test_filter_discv5_bootstrap_nodes() {
+        let nodes = vec![
+            "/ip4/1.2.3.4/tcp/8070/p2p/12D3KooTest".to_string(),
+            "spr:abc123".to_string(),
+            "enr:-example".to_string(),
+        ];
+
+        let filtered = Config::filter_discv5_bootstrap_nodes(&nodes);
+
+        assert_eq!(filtered, vec!["spr:abc123", "enr:-example"]);
+    }
+
+    #[test]
+    fn test_extract_discv5_bootstrap_nodes() {
+        let response = "spr:first\n\n# comment\nenr:-second\n/ip4/1.2.3.4/tcp/9000";
+
+        let extracted = Config::extract_discv5_bootstrap_nodes(response);
+
+        assert_eq!(extracted, vec!["spr:first", "enr:-second"]);
     }
 }

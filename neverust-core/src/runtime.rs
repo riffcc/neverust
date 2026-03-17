@@ -205,9 +205,26 @@ pub async fn run_node(config: Config) -> Result<(), P2PError> {
         config.disc_port
     );
 
-    // Pass SPR bootstrap nodes directly to DiscV5 — they contain UDP addresses
-    // and secp256k1 public keys needed for DHT bootstrapping.
-    let discv5_bootstrap: Vec<String> = config.bootstrap_nodes.clone();
+    let discv5_bootstrap = if config.bootstrap_nodes.is_empty() {
+        match Config::fetch_discv5_bootstrap_nodes().await {
+            Ok(nodes) => {
+                info!(
+                    "Fetched {} DiscV5 bootstrap record(s) for discovery startup",
+                    nodes.len()
+                );
+                nodes
+            }
+            Err(e) => {
+                warn!(
+                    "Failed to fetch DiscV5 bootstrap records: {}. Discovery will start without bootstrap peers.",
+                    e
+                );
+                Vec::new()
+            }
+        }
+    } else {
+        Config::filter_discv5_bootstrap_nodes(&config.bootstrap_nodes)
+    };
 
     // Get announce addresses for this node
     let announce_addrs = config.announce_addrs.clone();

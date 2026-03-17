@@ -6,8 +6,8 @@
 
 use cid::Cid;
 use discv5::{
-    enr, handler::NodeContact, rpc::RequestBody, rpc::ResponseBody, ConfigBuilder, Discv5,
-    Event as Discv5Event, ListenConfig,
+    enr, rpc::RequestBody, rpc::ResponseBody, ConfigBuilder, Discv5, Event as Discv5Event,
+    ListenConfig,
 };
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
@@ -17,6 +17,7 @@ use crate::dht_provider::{
     cid_to_node_id, handle_add_provider, handle_get_providers, new_provider_store,
     SharedProviderStore,
 };
+use crate::identify_spr::create_signed_peer_record;
 use crate::spr::{parse_spr_records_full, SprRecord};
 
 use libp2p::identity::PeerId;
@@ -275,10 +276,48 @@ impl Discovery {
             return Ok(local_providers);
         }
 
-        // Query DHT (future: send GetProviders to K closest nodes)
-        warn!("DHT GetProviders queries not yet fully implemented");
+        let candidate_nodes = match self.discv5.find_node(node_id).await {
+            Ok(nodes) if !nodes.is_empty() => nodes,
+            Ok(_) => self.discv5.table_entries_enr(),
+            Err(e) => {
+                warn!("Failed to find candidate nodes for GetProviders: {}", e);
+                self.discv5.table_entries_enr()
+            }
+        };
 
-        Err(DiscoveryError::NoProviders(cid.to_string()))
+        if candidate_nodes.is_empty() {
+            warn!("No DHT peers available to query for providers");
+            return Err(DiscoveryError::NoProviders(cid.to_string()));
+        }
+
+        let mut found = Vec::new();
+        for enr in candidate_nodes {
+            match self
+                .discv5
+                .get_providers(enr.clone(), content_id.clone())
+                .await
+            {
+                Ok((total, providers)) => {
+                    debug!(
+                        "GetProviders from {} returned total={} providers={}",
+                        enr.node_id(),
+                        total,
+                        providers.len()
+                    );
+                    found.extend(providers);
+                }
+                Err(e) => {
+                    debug!("GetProviders to {} failed: {}", enr.node_id(), e);
+                }
+            }
+        }
+
+        if found.is_empty() {
+            return Err(DiscoveryError::NoProviders(cid.to_string()));
+        }
+
+        info!("Found {} remote providers for CID {}", found.len(), cid);
+        Ok(found)
     }
 
     /// Get connected peer count
@@ -497,7 +536,6 @@ fn build_provider_record(
     keypair: &libp2p::identity::Keypair,
     announce_addrs: &[String],
 ) -> Vec<u8> {
-    use libp2p::core::{PeerRecord, SignedEnvelope};
     use libp2p::Multiaddr;
 
     let peer_id = keypair.public().to_peer_id();
@@ -506,10 +544,8 @@ fn build_provider_record(
         .filter_map(|a| a.parse().ok())
         .collect();
 
-    let peer_record = PeerRecord::new(keypair, addrs)
-        .expect("Failed to create PeerRecord");
-    let envelope = peer_record.into_signed_envelope();
-    envelope.into_protobuf_encoding()
+    create_signed_peer_record(keypair, peer_id, addrs)
+        .expect("Failed to create nim-libp2p compatible SignedPeerRecord")
 }
 
 /// Discovery statistics
@@ -523,6 +559,7 @@ pub struct DiscoveryStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
     use libp2p::identity::Keypair;
 
     #[tokio::test]
@@ -559,5 +596,22 @@ mod tests {
         // Find should return our local record
         let providers = discovery.find(&cid).await.unwrap();
         assert_eq!(providers.len(), 1);
+    }
+
+    #[test]
+    fn test_build_provider_record_matches_archivist_spr_format() {
+        let keypair = Keypair::generate_secp256k1();
+        let peer_id = keypair.public().to_peer_id();
+        let announce_addrs = vec!["/ip4/127.0.0.1/tcp/10700".to_string()];
+
+        let spr_bytes = build_provider_record(&keypair, &announce_addrs);
+        let spr_text = format!("spr:{}", URL_SAFE_NO_PAD.encode(spr_bytes));
+        let parsed = parse_spr_records_full(&spr_text).expect("should parse generated SPR");
+
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].peer_id, peer_id);
+        assert_eq!(parsed[0].addrs.len(), 1);
+        assert_eq!(parsed[0].addrs[0].to_string(), announce_addrs[0]);
+        assert!(parsed[0].secp256k1_pubkey.is_some());
     }
 }

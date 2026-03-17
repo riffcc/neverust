@@ -162,6 +162,12 @@ pub enum ServiceRequest {
         Vec<u8>,
         oneshot::Sender<Result<Vec<u8>, RequestError>>,
     ),
+    /// Send a GETPROVIDERS request to a designated peer and wait for a response.
+    GetProviders(
+        NodeContact,
+        Vec<u8>,
+        oneshot::Sender<Result<(u32, Vec<Vec<u8>>), RequestError>>,
+    ),
     /// The PING discv5 RPC function.
     Ping(Enr, Option<oneshot::Sender<Result<Pong, RequestError>>>),
     /// Send an AddProvider message (fire-and-forget, no response expected).
@@ -239,6 +245,8 @@ pub struct Pong {
 pub enum CallbackResponse {
     /// A response to a requested Nodes.
     Nodes(oneshot::Sender<Result<Vec<Enr>, RequestError>>),
+    /// A response to a requested Providers set.
+    Providers(oneshot::Sender<Result<(u32, Vec<Vec<u8>>), RequestError>>),
     /// A response from a TALK request
     Talk(oneshot::Sender<Result<Vec<u8>, RequestError>>),
     /// A response from a Pong request
@@ -357,6 +365,9 @@ impl Service {
                         }
                         ServiceRequest::Talk(node_contact, protocol, request, callback) => {
                             self.talk_request(node_contact, protocol, request, callback);
+                        }
+                        ServiceRequest::GetProviders(contact, content_id, callback) => {
+                            self.get_providers_request(contact, content_id, callback);
                         }
                         ServiceRequest::AddProvider(contact, content_id, provider_record) => {
                             self.send_add_provider(contact, content_id, provider_record);
@@ -890,8 +901,15 @@ impl Service {
                     _ => error!("Invalid callback for response"),
                 }
             }
-            ResponseBody::Providers { .. } => {
-                debug!("Received Providers response (not yet handled)");
+            ResponseBody::Providers { total, providers } => {
+                match active_request.callback {
+                    Some(CallbackResponse::Providers(callback)) => {
+                        if let Err(e) = callback.send(Ok((total, providers))) {
+                            warn!(error = ?e, "Failed to send callback response");
+                        }
+                    }
+                    _ => debug!("Received Providers response without callback"),
+                }
             }
         }
     }
@@ -1075,6 +1093,23 @@ impl Service {
             request_body,
             query_id: None,
             callback: Some(CallbackResponse::Talk(callback)),
+        };
+        self.send_rpc_request(active_request);
+    }
+
+    /// Requests provider records for the given content ID from a specific peer.
+    fn get_providers_request(
+        &mut self,
+        contact: NodeContact,
+        content_id: Vec<u8>,
+        callback: oneshot::Sender<Result<(u32, Vec<Vec<u8>>), RequestError>>,
+    ) {
+        let request_body = RequestBody::GetProviders { content_id };
+        let active_request = ActiveRequest {
+            contact,
+            request_body,
+            query_id: None,
+            callback: Some(CallbackResponse::Providers(callback)),
         };
         self.send_rpc_request(active_request);
     }
@@ -1576,6 +1611,12 @@ impl Service {
                     callback
                         .send(Err(error))
                         .unwrap_or_else(|_| debug!("Couldn't send Nodes error response to user"));
+                    return;
+                }
+                Some(CallbackResponse::Providers(callback)) => {
+                    callback
+                        .send(Err(error))
+                        .unwrap_or_else(|_| debug!("Couldn't send Providers error response to user"));
                     return;
                 }
                 Some(CallbackResponse::Talk(callback)) => {

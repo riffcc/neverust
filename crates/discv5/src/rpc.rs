@@ -585,7 +585,14 @@ impl Request {
             } => encode_addprovider_body(content_id, provider_record),
             RequestBody::GetProviders { content_id } => encode_getproviders_body(content_id),
         };
-        encode_envelope(msg_type, id_bytes, &inner_body)
+        let encoded = encode_envelope(msg_type, id_bytes, &inner_body);
+        debug!(
+            msg_type = msg_type,
+            body_hex = hex::encode(&inner_body),
+            envelope_hex = hex::encode(&encoded),
+            "Encoded request"
+        );
+        encoded
     }
 }
 

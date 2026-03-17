@@ -2586,6 +2586,7 @@ dependencies = [
  "tower",
  "tower-http",
  "tracing",
+ "tracing-subscriber",
  "unsigned-varint 0.8.0",
  "void",
 ]
