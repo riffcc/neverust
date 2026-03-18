@@ -53,6 +53,10 @@ pub struct StartCommand {
     #[arg(long, default_value_t = 8080)]
     pub api_port: u16,
 
+    /// Bind address for the REST API (e.g. 127.0.0.1 to restrict to localhost)
+    #[arg(long, default_value = "0.0.0.0")]
+    pub api_bind: String,
+
     /// Node operating mode: altruistic (free blocks) or marketplace (paid blocks)
     #[arg(long, default_value = "altruistic")]
     pub mode: String,
@@ -156,6 +160,8 @@ pub struct Config {
     pub listen_port: u16,
     pub disc_port: u16,
     pub api_port: u16,
+    #[serde(default = "default_api_bind")]
+    pub api_bind: String,
     pub log_level: String,
     #[serde(default)]
     pub bootstrap_nodes: Vec<String>,
@@ -203,6 +209,10 @@ pub struct Config {
     pub citadel_max_new_origins_per_host_per_round: u32,
 }
 
+fn default_api_bind() -> String {
+    "0.0.0.0".to_string()
+}
+
 fn default_citadel_site_id() -> u64 {
     1
 }
@@ -238,6 +248,7 @@ impl Default for Config {
             listen_port: 8070,
             disc_port: 8090,
             api_port: 8080,
+            api_bind: default_api_bind(),
             log_level: "info".to_string(),
             bootstrap_nodes: Vec::new(),
             mode: "altruistic".to_string(),
@@ -469,6 +480,7 @@ impl From<StartCommand> for Config {
             listen_port: cmd.listen_port,
             disc_port: cmd.disc_port,
             api_port: cmd.api_port,
+            api_bind: cmd.api_bind,
             log_level: cmd.log_level,
             bootstrap_nodes: cmd.bootstrap_node,
             mode: cmd.mode,
@@ -520,6 +532,7 @@ mod tests {
             listen_port: 9000,
             disc_port: 9001,
             api_port: 9002,
+            api_bind: "127.0.0.1".to_string(),
             mode: "marketplace".to_string(),
             price_per_byte: 100,
             persistence: true,

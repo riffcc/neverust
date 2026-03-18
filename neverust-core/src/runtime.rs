@@ -281,6 +281,7 @@ pub async fn run_node(config: Config) -> Result<(), P2PError> {
     let api_keypair = Arc::new(keypair);
     let api_listen_addrs = listen_addrs.clone();
     let api_port = config.api_port;
+    let api_bind = config.api_bind.clone();
     let api_citadel = citadel_node.clone();
     let api_marketplace = if config.persistence {
         Some(
@@ -318,7 +319,7 @@ pub async fn run_node(config: Config) -> Result<(), P2PError> {
             api_marketplace,
             api_marketplace_info,
         );
-        let addr = format!("0.0.0.0:{}", api_port);
+        let addr = format!("{}:{}", api_bind, api_port);
         info!("Starting REST API on {}", addr);
 
         match tokio::net::TcpListener::bind(&addr).await {
