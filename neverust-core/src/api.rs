@@ -19,6 +19,7 @@ use tower_http::trace::TraceLayer;
 use tracing::{error, info};
 
 use crate::archivist_tree::ArchivistTree;
+use crate::folder_manifest::{FolderEntry, FolderManifest, FOLDER_MANIFEST_CODEC};
 use crate::botg::BoTgProtocol;
 use crate::citadel::{
     run_defederation_simulation, CitadelSyncPullRequest, CitadelSyncPullResponse,
@@ -512,6 +513,19 @@ pub fn create_router_with_runtime(
         .route("/api/archivist/v1/peerid", get(peer_id_endpoint))
         .route("/api/archivist/v1/stats", get(archivist_stats))
         .route("/api/archivist/v1/spr", get(spr_endpoint))
+        // Folder manifest endpoints
+        .route(
+            "/api/archivist/v1/folder",
+            post(archivist_create_folder),
+        )
+        .route(
+            "/api/archivist/v1/folder/{cid}",
+            get(archivist_list_folder),
+        )
+        .route(
+            "/api/archivist/v1/stream/{folder_cid}/{filename}",
+            get(archivist_stream_folder_file),
+        )
         // IPFS Cluster-style compatibility endpoints
         .route("/api/ipfs-cluster/v1/pins", get(ipfs_cluster_list_pins))
         .route(
@@ -1979,6 +1993,217 @@ async fn spr_endpoint(State(state): State<ApiState>) -> Result<String, ApiError>
     );
 
     Ok(spr)
+}
+
+// --- Folder manifest types and handlers ---
+
+#[derive(Deserialize)]
+struct CreateFolderEntryRequest {
+    name: String,
+    manifest_cid: String,
+    #[serde(default)]
+    size: Option<u64>,
+    #[serde(default)]
+    mimetype: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct CreateFolderRequest {
+    entries: Vec<CreateFolderEntryRequest>,
+}
+
+#[derive(Serialize)]
+struct FolderEntryResponse {
+    name: String,
+    manifest_cid: String,
+    size: u64,
+    mimetype: String,
+}
+
+#[derive(Serialize)]
+struct FolderResponse {
+    cid: String,
+    entries: Vec<FolderEntryResponse>,
+}
+
+/// Create a folder manifest from a list of file manifest CIDs.
+///
+/// POST /api/archivist/v1/folder
+async fn archivist_create_folder(
+    State(state): State<ApiState>,
+    Json(req): Json<CreateFolderRequest>,
+) -> Result<Json<FolderResponse>, ApiError> {
+    if req.entries.is_empty() {
+        return Err(ApiError::BadRequest(
+            "Folder must have at least one entry".to_string(),
+        ));
+    }
+
+    let mut entries = Vec::with_capacity(req.entries.len());
+    for entry_req in &req.entries {
+        let cid: Cid = entry_req
+            .manifest_cid
+            .parse()
+            .map_err(|e| ApiError::BadRequest(format!("Invalid CID '{}': {}", entry_req.manifest_cid, e)))?;
+
+        // Try to load the manifest to get size/mimetype, but allow override via request
+        let (size, mimetype) = if let (Some(s), Some(m)) = (entry_req.size, entry_req.mimetype.as_ref()) {
+            (s, m.clone())
+        } else if let Ok(block) = state.block_store.get(&cid).await {
+            if cid.codec() == 0xcd01 {
+                if let Ok(manifest) = Manifest::from_block(&block) {
+                    (
+                        entry_req.size.unwrap_or(manifest.dataset_size),
+                        entry_req.mimetype.clone().unwrap_or_else(|| {
+                            manifest.mimetype.unwrap_or_default()
+                        }),
+                    )
+                } else {
+                    (entry_req.size.unwrap_or(block.data.len() as u64), entry_req.mimetype.clone().unwrap_or_default())
+                }
+            } else {
+                (entry_req.size.unwrap_or(block.data.len() as u64), entry_req.mimetype.clone().unwrap_or_default())
+            }
+        } else {
+            // CID not stored locally — use provided values or defaults
+            (entry_req.size.unwrap_or(0), entry_req.mimetype.clone().unwrap_or_default())
+        };
+
+        entries.push(FolderEntry {
+            name: entry_req.name.clone(),
+            manifest_cid: cid,
+            size,
+            mimetype,
+        });
+    }
+
+    let folder = FolderManifest::new(entries);
+    let block = folder
+        .to_block()
+        .map_err(|e| ApiError::Internal(format!("Failed to create folder block: {}", e)))?;
+
+    let folder_cid = block.cid;
+    let folder_cid_str = folder_cid.to_string();
+
+    state
+        .block_store
+        .put(block)
+        .await
+        .map_err(|e| ApiError::Internal(format!("Failed to store folder block: {}", e)))?;
+
+    info!("Created folder manifest {} with {} entries", folder_cid_str, folder.entries.len());
+
+    let response_entries = folder
+        .entries
+        .iter()
+        .map(|e| FolderEntryResponse {
+            name: e.name.clone(),
+            manifest_cid: e.manifest_cid.to_string(),
+            size: e.size,
+            mimetype: e.mimetype.clone(),
+        })
+        .collect();
+
+    Ok(Json(FolderResponse {
+        cid: folder_cid_str,
+        entries: response_entries,
+    }))
+}
+
+/// List entries in a folder manifest.
+///
+/// GET /api/archivist/v1/folder/:cid
+async fn archivist_list_folder(
+    State(state): State<ApiState>,
+    Path(cid_str): Path<String>,
+) -> Result<Json<FolderResponse>, ApiError> {
+    let cid: Cid = cid_str
+        .parse()
+        .map_err(|e| ApiError::BadRequest(format!("Invalid CID: {}", e)))?;
+
+    let block = state.block_store.get(&cid).await.map_err(|e| match e {
+        StorageError::BlockNotFound(_) => ApiError::NotFound(cid_str.clone()),
+        _ => ApiError::Internal(format!("Failed to retrieve block: {}", e)),
+    })?;
+
+    if cid.codec() != FOLDER_MANIFEST_CODEC {
+        return Err(ApiError::BadRequest(format!(
+            "CID {} is not a folder manifest (codec 0x{:x}, expected 0x{:x})",
+            cid_str,
+            cid.codec(),
+            FOLDER_MANIFEST_CODEC
+        )));
+    }
+
+    let folder = FolderManifest::from_block(&block)
+        .map_err(|e| ApiError::Internal(format!("Failed to decode folder manifest: {}", e)))?;
+
+    let entries = folder
+        .entries
+        .iter()
+        .map(|e| FolderEntryResponse {
+            name: e.name.clone(),
+            manifest_cid: e.manifest_cid.to_string(),
+            size: e.size,
+            mimetype: e.mimetype.clone(),
+        })
+        .collect();
+
+    Ok(Json(FolderResponse {
+        cid: cid_str,
+        entries,
+    }))
+}
+
+/// Stream a single file from a folder manifest by filename.
+///
+/// GET /api/archivist/v1/stream/:folder_cid/:filename
+async fn archivist_stream_folder_file(
+    State(state): State<ApiState>,
+    Path((folder_cid_str, filename)): Path<(String, String)>,
+) -> Result<Response, ApiError> {
+    let folder_cid: Cid = folder_cid_str
+        .parse()
+        .map_err(|e| ApiError::BadRequest(format!("Invalid folder CID: {}", e)))?;
+
+    let folder_block = state
+        .block_store
+        .get(&folder_cid)
+        .await
+        .map_err(|e| match e {
+            StorageError::BlockNotFound(_) => ApiError::NotFound(folder_cid_str.clone()),
+            _ => ApiError::Internal(format!("Failed to retrieve folder block: {}", e)),
+        })?;
+
+    let folder = FolderManifest::from_block(&folder_block)
+        .map_err(|e| ApiError::Internal(format!("Failed to decode folder manifest: {}", e)))?;
+
+    let entry = folder.find_entry(&filename).ok_or_else(|| {
+        ApiError::NotFound(format!(
+            "File '{}' not found in folder {}",
+            filename, folder_cid_str
+        ))
+    })?;
+
+    let manifest_cid_str = entry.manifest_cid.to_string();
+    let data = retrieve_local_cid_data(&state, &entry.manifest_cid, &manifest_cid_str).await?;
+
+    let content_type = if entry.mimetype.is_empty() {
+        "application/octet-stream"
+    } else {
+        &entry.mimetype
+    };
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("Content-Type", content_type)
+        .header(
+            "Content-Disposition",
+            format!("inline; filename=\"{}\"", filename),
+        )
+        .header("Content-Length", data.len().to_string())
+        .body(Body::from(data))
+        .map_err(|e| ApiError::Internal(format!("Failed to build response: {}", e)))
 }
 
 /// API error type

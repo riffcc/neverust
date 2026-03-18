@@ -14,6 +14,7 @@ pub mod citadel_sync;
 pub mod cluster;
 pub mod config;
 pub mod dht_provider;
+pub mod folder_manifest;
 pub mod discovery;
 pub mod eth_key;
 pub mod identify_shim;
@@ -46,6 +47,9 @@ pub use citadel::{
 pub use cluster::{select_replicas, upload_path_for_cid_str, ClusterNode};
 pub use config::Config;
 pub use eth_key::{load_or_generate as load_or_generate_eth_key, EthKey, EthKeyError};
+pub use folder_manifest::{
+    FolderEntry, FolderManifest, FolderManifestError, FOLDER_MANIFEST_CODEC,
+};
 pub use discovery::{Discovery, DiscoveryError, DiscoveryStats};
 pub use manifest::{
     ErasureInfo, Manifest, ManifestError, StrategyType, VerificationInfo, BLAKE3_CODEC,
