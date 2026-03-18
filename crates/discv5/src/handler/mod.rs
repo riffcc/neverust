@@ -36,6 +36,7 @@ use crate::{
     socket::{FilterConfig, Socket},
     Enr, ProtocolIdentity,
 };
+use alloy_rlp::Decodable;
 use delay_map::HashMapDelay;
 use enr::{CombinedKey, NodeId};
 use futures::prelude::*;
@@ -220,6 +221,9 @@ pub struct Handler {
     service_send: mpsc::Sender<HandlerOut>,
     /// The listening sockets to filter out any attempted requests to self.
     listen_sockets: SmallVec<[SocketAddr; 2]>,
+    /// Pre-computed SPR (protobuf SignedPeerRecord) bytes for handshake auth.
+    /// Built from the local key + ENR addresses at startup.
+    local_spr: Vec<u8>,
     /// The discovery v5 UDP socket tasks.
     socket: Socket,
     /// Exit channel to shutdown the handler.
@@ -288,6 +292,8 @@ impl Handler {
         // Attempt to bind to the socket before spinning up the send/recv tasks.
         let socket = Socket::new(socket_config).await?;
 
+        let local_spr = build_local_spr(&enr.read(), &key.read());
+
         config
             .executor
             .clone()
@@ -309,6 +315,7 @@ impl Handler {
                     active_challenges: HashMapDelay::new(config.request_timeout),
                     service_recv,
                     service_send,
+                    local_spr,
                     listen_sockets,
                     socket,
                     exit,
@@ -380,8 +387,27 @@ impl Handler {
                 src_id,
                 id_nonce_sig,
                 ephem_pubkey,
-                enr_record,
+                record_bytes,
             } => {
+                // Try to decode the record bytes as ENR (for neverust peers)
+                // or as SPR (for Archivist peers). Either way, extract the ENR
+                // for the routing table.
+                let enr_record = record_bytes.and_then(|bytes| {
+                    // Try ENR (RLP) first
+                    if let Ok(enr) = <Enr>::decode(&mut bytes.as_slice()) {
+                        return Some(enr);
+                    }
+                    // Try SPR (protobuf) — use enr_from_spr_bytes from rpc module
+                    if let Some(enr) = crate::rpc::enr_from_spr_bytes(&bytes) {
+                        return Some(enr);
+                    }
+                    debug!(
+                        bytes = bytes.len(),
+                        "Could not decode handshake record as ENR or SPR"
+                    );
+                    None
+                });
+
                 let node_address = NodeAddress {
                     socket_addr: inbound_packet.src_address,
                     node_id: src_id,
@@ -664,9 +690,9 @@ impl Handler {
 
         // Encrypt the message with an auth header and respond
 
-        // First if a new version of our ENR is requested, obtain it for the header
-        let updated_enr = if enr_seq < self.enr.read().seq() {
-            Some(self.enr.read().clone())
+        // If our record is newer than what the remote knows, include our SPR
+        let record_bytes = if enr_seq < self.enr.read().seq() {
+            Some(self.local_spr.clone())
         } else {
             None
         };
@@ -675,7 +701,7 @@ impl Handler {
         let (auth_packet, mut session) = match Session::encrypt_with_header(
             request_call.contact(),
             self.key.clone(),
-            updated_enr,
+            record_bytes,
             &self.node_id,
             self.protocol_identity,
             &challenge_data,
@@ -1391,4 +1417,216 @@ impl Handler {
             false
         }
     }
+}
+
+#[cfg(feature = "libp2p")]
+pub(crate) fn build_local_spr(enr: &Enr, key: &enr::CombinedKey) -> Vec<u8> {
+    use crate::rpc::{encode_field_bytes, encode_field_varint};
+    use libp2p_identity::{
+        secp256k1::{Keypair as Libp2pSecp256k1Keypair, SecretKey as Libp2pSecretKey},
+        Keypair as Libp2pKeypair,
+    };
+    use multiaddr::{Multiaddr, Protocol};
+
+    let mut secret_bytes = match key {
+        enr::CombinedKey::Secp256k1(sk) => sk.to_bytes().to_vec(),
+        _ => {
+            warn!("Non-secp256k1 key, SPR will be empty");
+            return Vec::new();
+        }
+    };
+
+    let secret = match Libp2pSecretKey::try_from_bytes(&mut secret_bytes) {
+        Ok(secret) => secret,
+        Err(e) => {
+            warn!(error = %e, "Failed to convert discv5 key into libp2p secp256k1 key");
+            return Vec::new();
+        }
+    };
+    let keypair: Libp2pKeypair = Libp2pSecp256k1Keypair::from(secret).into();
+    let proto_pubkey = keypair.public().encode_protobuf();
+
+    let peer_id_bytes = keypair.public().to_peer_id().to_bytes();
+
+    let mut multiaddrs = Vec::<Multiaddr>::new();
+    match (enr.ip4(), enr.udp4(), enr.tcp4()) {
+        (Some(ip), Some(udp_port), _) => {
+            let mut addr = Multiaddr::empty();
+            addr.push(Protocol::Ip4(ip));
+            addr.push(Protocol::Udp(udp_port));
+            multiaddrs.push(addr);
+        }
+        (Some(ip), None, Some(tcp_port)) => {
+            let mut addr = Multiaddr::empty();
+            addr.push(Protocol::Ip4(ip));
+            addr.push(Protocol::Tcp(tcp_port));
+            multiaddrs.push(addr);
+        }
+        _ => {}
+    }
+    match (enr.ip6(), enr.udp6(), enr.tcp6()) {
+        (Some(ip), Some(udp_port), _) => {
+            let mut addr = Multiaddr::empty();
+            addr.push(Protocol::Ip6(ip));
+            addr.push(Protocol::Udp(udp_port));
+            multiaddrs.push(addr);
+        }
+        (Some(ip), None, Some(tcp_port)) => {
+            let mut addr = Multiaddr::empty();
+            addr.push(Protocol::Ip6(ip));
+            addr.push(Protocol::Tcp(tcp_port));
+            multiaddrs.push(addr);
+        }
+        _ => {}
+    }
+
+    let mut addrs_proto = Vec::new();
+    for multiaddr in &multiaddrs {
+        let mut addr_info = Vec::new();
+        addr_info.extend_from_slice(&encode_field_bytes(1, &multiaddr.to_vec()));
+        addrs_proto.extend_from_slice(&encode_field_bytes(3, &addr_info));
+    }
+
+    let mut peer_record = Vec::new();
+    peer_record.extend_from_slice(&encode_field_bytes(1, &peer_id_bytes));
+    peer_record.extend_from_slice(&encode_field_varint(2, enr.seq()));
+    peer_record.extend_from_slice(&addrs_proto);
+
+    let domain = "libp2p-peer-record";
+    let payload_type = b"\x03\x01";
+    let mut sig_buf = Vec::new();
+    sig_buf.extend_from_slice(&crate::rpc::encode_varint(domain.len() as u64));
+    sig_buf.extend_from_slice(domain.as_bytes());
+    sig_buf.extend_from_slice(&crate::rpc::encode_varint(payload_type.len() as u64));
+    sig_buf.extend_from_slice(payload_type);
+    sig_buf.extend_from_slice(&crate::rpc::encode_varint(peer_record.len() as u64));
+    sig_buf.extend_from_slice(&peer_record);
+
+    let signature = match keypair.sign(&sig_buf) {
+        Ok(signature) => signature,
+        Err(e) => {
+            warn!(error = %e, "Failed to sign local SPR");
+            return Vec::new();
+        }
+    };
+
+    let mut envelope = Vec::new();
+    envelope.extend_from_slice(&encode_field_bytes(1, &proto_pubkey));
+    envelope.extend_from_slice(&encode_field_bytes(2, payload_type));
+    envelope.extend_from_slice(&encode_field_bytes(3, &peer_record));
+    envelope.extend_from_slice(&encode_field_bytes(5, &signature));
+
+    debug!(
+        spr_len = envelope.len(),
+        multiaddrs = multiaddrs.len(),
+        "Built local SPR for handshake"
+    );
+
+    envelope
+}
+
+#[cfg(not(feature = "libp2p"))]
+/// Build a protobuf-encoded SPR (SignedPeerRecord / libp2p Envelope) from the
+/// local ENR and signing key.
+///
+/// The SPR format is a protobuf Envelope:
+///   field 1: publicKey (protobuf {field 1: key_type=2, field 2: compressed_key})
+///   field 2: payloadType ("/libp2p/routing-record\x00\x01")
+///   field 3: payload (PeerRecord protobuf)
+///   field 5: signature
+///
+/// PeerRecord protobuf:
+///   field 1: peerId (multihash identity of protobuf pubkey)
+///   field 2: seqNo (varint)
+///   field 3 (repeated): AddressInfo { field 1: multiaddr bytes }
+pub(crate) fn build_local_spr(enr: &Enr, key: &enr::CombinedKey) -> Vec<u8> {
+    use crate::rpc::{encode_field_bytes, encode_field_varint};
+
+    // Extract compressed secp256k1 public key (33 bytes)
+    let compressed_pubkey = match key {
+        enr::CombinedKey::Secp256k1(sk) => {
+            let vk = sk.verifying_key();
+            vk.to_sec1_bytes().to_vec()
+        }
+        _ => {
+            warn!("Non-secp256k1 key, SPR will be empty");
+            return Vec::new();
+        }
+    };
+
+    // Build protobuf-encoded public key: {field 1: type=2(Secp256k1), field 2: key_data}
+    let mut proto_pubkey = Vec::new();
+    proto_pubkey.extend_from_slice(&encode_field_varint(1, 2)); // KeyType::Secp256k1 = 2
+    proto_pubkey.extend_from_slice(&encode_field_bytes(2, &compressed_pubkey));
+
+    // Build PeerId = identity multihash of proto_pubkey
+    let mut peer_id_bytes = Vec::new();
+    peer_id_bytes.push(0x00); // identity hash code
+    peer_id_bytes.push(proto_pubkey.len() as u8);
+    peer_id_bytes.extend_from_slice(&proto_pubkey);
+
+    // Build multiaddr for our listening address from ENR
+    let mut addrs_proto = Vec::new();
+    if let Some(ip4) = enr.ip4() {
+        if let Some(udp4) = enr.udp4() {
+            // /ip4/x.x.x.x/udp/port
+            let mut ma = Vec::new();
+            ma.push(0x04); // ip4 protocol code
+            ma.extend_from_slice(&ip4.octets());
+            ma.push(0x91); ma.push(0x02); // udp protocol code (273 as varint)
+            ma.extend_from_slice(&udp4.to_be_bytes());
+
+            // AddressInfo: { field 1: multiaddr }
+            let mut addr_info = Vec::new();
+            addr_info.extend_from_slice(&encode_field_bytes(1, &ma));
+            addrs_proto.extend_from_slice(&encode_field_bytes(3, &addr_info));
+        }
+    }
+
+    // PeerRecord: { field 1: peerId, field 2: seqNo, field 3: addresses }
+    let mut peer_record = Vec::new();
+    peer_record.extend_from_slice(&encode_field_bytes(1, &peer_id_bytes));
+    peer_record.extend_from_slice(&encode_field_varint(2, enr.seq()));
+    peer_record.extend_from_slice(&addrs_proto);
+
+    // Sign the peer record (domain separation as per libp2p spec)
+    // signature_payload = len(domain) || domain || payload_type || payload
+    let domain = "libp2p-peer-record";
+    let payload_type = b"\x03\x01"; // "/libp2p/routing-record" encoded as 0x0301
+    // Actually the payloadType in libp2p is: the bytes [0x03, 0x01]
+    // Let me use the correct domain separation from the libp2p spec
+
+    let mut sig_buf = Vec::new();
+    // varint(domain.len()) || domain
+    sig_buf.extend_from_slice(&crate::rpc::encode_varint(domain.len() as u64));
+    sig_buf.extend_from_slice(domain.as_bytes());
+    // varint(payload_type.len()) || payload_type
+    sig_buf.extend_from_slice(&crate::rpc::encode_varint(payload_type.len() as u64));
+    sig_buf.extend_from_slice(payload_type);
+    // varint(payload.len()) || payload
+    sig_buf.extend_from_slice(&crate::rpc::encode_varint(peer_record.len() as u64));
+    sig_buf.extend_from_slice(&peer_record);
+
+    let signature = match key {
+        enr::CombinedKey::Secp256k1(sk) => {
+            use enr::k256::ecdsa::{signature::Signer, Signature};
+            let sig: Signature = sk.sign(&sig_buf);
+            sig.to_der().as_bytes().to_vec()
+        }
+        _ => Vec::new(),
+    };
+
+    // Envelope: { field 1: publicKey, field 2: payloadType, field 3: payload, field 5: signature }
+    let mut envelope = Vec::new();
+    envelope.extend_from_slice(&encode_field_bytes(1, &proto_pubkey));
+    envelope.extend_from_slice(&encode_field_bytes(2, payload_type));
+    envelope.extend_from_slice(&encode_field_bytes(3, &peer_record));
+    envelope.extend_from_slice(&encode_field_bytes(5, &signature));
+
+    debug!(
+        spr_len = envelope.len(),
+        "Built local SPR for handshake"
+    );
+
+    envelope
 }

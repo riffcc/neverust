@@ -217,7 +217,7 @@ impl Session {
     pub(crate) fn encrypt_with_header(
         remote_contact: &NodeContact,
         local_key: Arc<RwLock<CombinedKey>>,
-        updated_enr: Option<Enr>,
+        record_bytes: Option<Vec<u8>>,
         local_node_id: &NodeId,
         protocol_identity: ProtocolIdentity,
         challenge_data: &ChallengeData,
@@ -249,7 +249,7 @@ impl Session {
             protocol_identity,
             sig,
             ephem_pubkey,
-            updated_enr,
+            record_bytes,
         );
 
         // Create the authenticated data for the new packet.

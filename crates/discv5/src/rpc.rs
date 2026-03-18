@@ -11,7 +11,7 @@ use tracing::{debug, warn};
 // Protobuf encoding helpers
 // ---------------------------------------------------------------------------
 
-fn encode_varint(mut value: u64) -> Vec<u8> {
+pub fn encode_varint(mut value: u64) -> Vec<u8> {
     let mut buf = Vec::with_capacity(10);
     loop {
         let byte = (value & 0x7F) as u8;
@@ -25,14 +25,14 @@ fn encode_varint(mut value: u64) -> Vec<u8> {
     buf
 }
 
-fn encode_field_varint(field_num: u32, value: u64) -> Vec<u8> {
+pub fn encode_field_varint(field_num: u32, value: u64) -> Vec<u8> {
     let key = (field_num as u64) << 3; // wire type 0
     let mut buf = encode_varint(key);
     buf.extend_from_slice(&encode_varint(value));
     buf
 }
 
-fn encode_field_bytes(field_num: u32, data: &[u8]) -> Vec<u8> {
+pub fn encode_field_bytes(field_num: u32, data: &[u8]) -> Vec<u8> {
     let key = ((field_num as u64) << 3) | 2; // wire type 2
     let mut buf = encode_varint(key);
     buf.extend_from_slice(&encode_varint(data.len() as u64));
@@ -147,10 +147,7 @@ fn encode_ip_proto(ip: &IpAddr) -> Vec<u8> {
 
 /// Decode an IP address from the nested protobuf bytes.
 fn decode_ip_proto(data: &[u8]) -> Result<IpAddr, DecoderError> {
-    // Strip length prefix
-    let (length, prefix_len) = decode_varint(data)?;
-    let inner = &data[prefix_len..prefix_len + length as usize];
-    let fields = decode_all_fields(inner)?;
+    let fields = decode_all_fields(data)?;
     let mut family: Option<u8> = None;
     let mut ip_bytes: Option<Vec<u8>> = None;
     for (fnum, _wt, fdata) in &fields {
@@ -432,7 +429,7 @@ fn decode_envelope(data: &[u8]) -> Result<(Vec<u8>, Vec<u8>), DecoderError> {
 /// extracting the secp256k1 public key and addresses. The resulting ENR
 /// has `externally_verified = true` with the correct NodeId derived from
 /// the SPR's public key via keccak256.
-fn enr_from_spr_bytes(spr_bytes: &[u8]) -> Option<Enr<CombinedKey>> {
+pub fn enr_from_spr_bytes(spr_bytes: &[u8]) -> Option<Enr<CombinedKey>> {
     // Parse the SignedEnvelope protobuf:
     // field 1 = public_key (protobuf: {field 1: key_type, field 2: key_data})
     // field 2 = payload_type
@@ -1536,10 +1533,10 @@ mod tests {
     }
 
     #[test]
-    fn proto_message_length_prefix() {
+    fn proto_message_has_no_length_prefix() {
         let fields = vec![0x08, 0x01]; // field 1, varint 1
         let msg = encode_proto_message(&fields);
-        assert_eq!(msg, vec![0x02, 0x08, 0x01]);
+        assert_eq!(msg, vec![0x08, 0x01]);
     }
 
     #[test]

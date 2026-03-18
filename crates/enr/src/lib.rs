@@ -331,6 +331,17 @@ impl<K: EnrKey> Enr<K> {
         })
     }
 
+    /// Re-derive this record's NodeId using Archivist's SPR/libp2p identity path.
+    ///
+    /// This keeps the ENR contents and signature intact and only adjusts the locally
+    /// cached `node_id` field so DiscV5 packet identities line up with Archivist's
+    /// SignedPeerRecord-derived NodeId.
+    pub fn use_archivist_node_id(&mut self) -> Result<(), Error> {
+        let node_id = archivist_node_id_from_secp256k1(self.public_key().encode().as_ref())?;
+        self.node_id = node_id;
+        Ok(())
+    }
+
     // getters //
 
     /// The `NodeId` for the record.

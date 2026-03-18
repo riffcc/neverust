@@ -381,6 +381,12 @@ impl Discv5 {
         self.local_enr.read().clone()
     }
 
+    /// Returns the local discovery SignedPeerRecord bytes used for Archivist-style
+    /// bootstrap and handshake flows.
+    pub fn local_spr_bytes(&self) -> Vec<u8> {
+        crate::handler::build_local_spr(&self.local_enr.read(), &self.enr_key.read())
+    }
+
     /// Identical to `Discv5::local_enr` except that this exposes the `Arc` itself.
     ///
     /// This is useful for synchronising views of the local ENR outside of `Discv5`.

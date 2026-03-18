@@ -9,10 +9,8 @@
 //!
 //! [`Packet`]: enum.Packet.html
 
-use crate::{error::PacketError, Enr};
+use crate::error::PacketError;
 use aes::cipher::{generic_array::GenericArray, KeyIvInit, StreamCipher};
-use alloy_rlp::Decodable;
-
 type Aes128Ctr64BE = ctr::Ctr64BE<aes::Aes128>;
 
 use enr::NodeId;
@@ -141,8 +139,9 @@ pub enum PacketKind {
         id_nonce_sig: Vec<u8>,
         /// The ephemeral public key of the handshake.
         ephem_pubkey: Vec<u8>,
-        /// The ENR record of the node if the WHOAREYOU request is out-dated.
-        enr_record: Option<Enr>,
+        /// The node record bytes (SPR protobuf for Archivist, or RLP ENR).
+        /// Raw bytes appended to auth_data after the ephemeral key.
+        record_bytes: Option<Vec<u8>>,
     },
 }
 
@@ -172,15 +171,14 @@ impl PacketKind {
                 src_id,
                 id_nonce_sig,
                 ephem_pubkey,
-                enr_record,
+                record_bytes,
             } => {
                 let sig_size = id_nonce_sig.len();
                 let pubkey_size = ephem_pubkey.len();
-                let node_record = enr_record.as_ref().map(alloy_rlp::encode);
                 let expected_len = 34
                     + sig_size
                     + pubkey_size
-                    + node_record.as_ref().map(|x| x.len()).unwrap_or_default();
+                    + record_bytes.as_ref().map(|x| x.len()).unwrap_or_default();
 
                 let mut auth_data = Vec::with_capacity(expected_len);
                 auth_data.extend_from_slice(&src_id.raw());
@@ -188,8 +186,8 @@ impl PacketKind {
                 auth_data.extend_from_slice(&(pubkey_size as u8).to_be_bytes());
                 auth_data.extend_from_slice(id_nonce_sig);
                 auth_data.extend_from_slice(ephem_pubkey);
-                if let Some(node_record) = node_record {
-                    auth_data.extend_from_slice(&node_record);
+                if let Some(record) = record_bytes {
+                    auth_data.extend_from_slice(record);
                 }
                 debug_assert_eq!(auth_data.len(), expected_len);
                 auth_data
@@ -266,20 +264,8 @@ impl PacketKind {
                 // nodes do), gracefully skip the record instead of
                 // rejecting the handshake. The session key is derived from
                 // the ephemeral key exchange regardless.
-                let enr_record = if remaining_data.len() > total_size {
-                    match <Enr>::decode(&mut &remaining_data[total_size..]) {
-                        Ok(enr) => Some(enr),
-                        Err(e) => {
-                            let record_bytes = remaining_data.len() - total_size;
-                            tracing::debug!(
-                                bytes = record_bytes,
-                                error = %e,
-                                "Failed to decode node record as ENR in handshake \
-                                 (remote may use SPR format), skipping",
-                            );
-                            None
-                        }
-                    }
+                let record_bytes = if remaining_data.len() > total_size {
+                    Some(remaining_data[total_size..].to_vec())
                 } else {
                     None
                 };
@@ -288,7 +274,7 @@ impl PacketKind {
                     src_id,
                     id_nonce_sig,
                     ephem_pubkey,
-                    enr_record,
+                    record_bytes,
                 })
             }
             _ => Err(PacketError::UnknownPacket),
@@ -352,7 +338,7 @@ impl Packet {
         protocol_identity: ProtocolIdentity,
         id_nonce_sig: Vec<u8>,
         ephem_pubkey: Vec<u8>,
-        enr_record: Option<Enr>,
+        record_bytes: Option<Vec<u8>>,
     ) -> Self {
         let iv: u128 = rand::random();
 
@@ -363,7 +349,7 @@ impl Packet {
                 src_id,
                 id_nonce_sig,
                 ephem_pubkey,
-                enr_record,
+                record_bytes,
             },
         };
 
@@ -594,14 +580,14 @@ impl std::fmt::Display for PacketKind {
                 src_id,
                 id_nonce_sig,
                 ephem_pubkey,
-                enr_record,
+                record_bytes,
             } => write!(
                 f,
-                "Handshake {{ src_id : {}, id_nonce_sig: {}, ephem_pubkey: {}, enr_record {:?}",
+                "Handshake {{ src_id : {}, id_nonce_sig: {}, ephem_pubkey: {}, record_bytes_len {:?}",
                 hex::encode(src_id.raw()),
                 hex::encode(id_nonce_sig),
                 hex::encode(ephem_pubkey),
-                enr_record
+                record_bytes.as_ref().map(Vec::len)
             ),
         }
     }
@@ -610,6 +596,7 @@ impl std::fmt::Display for PacketKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Enr;
     use enr::{CombinedKey, EnrKey};
 
     fn init_log() {
@@ -703,7 +690,7 @@ mod tests {
         let message_nonce: MessageNonce = [52u8; MESSAGE_NONCE_LENGTH];
         let id_nonce_sig = vec![5u8; 64];
         let ephem_pubkey = vec![6u8; 33];
-        let enr_record = None;
+        let record_bytes = None;
         let iv = 0u128;
 
         let expected_output = hex::decode("0000000000000000000000000000000035a14bcdb844ae25f36070f07e0b25e765ed72b4d69c99d5fe5a8d438a4b5b518dfead9d80200875c23e31d0acda6f1b2a6124a70e3dc1f2b8b0770f24d8da18605ff3f5b60b090c61515093a88ef4c02186f7d1b5c9a88fdb8cfae239f13e451758751561b439d8044e27cecdf646f2aa1c9ecbd5faf37eb67a4f6337f4b2a885391e631f72deb808c63bf0b0faed23d7117f7a2e1f98c28bd0").unwrap();
@@ -714,7 +701,7 @@ mod tests {
                 src_id,
                 id_nonce_sig,
                 ephem_pubkey,
-                enr_record,
+                record_bytes,
             },
             protocol_identity: ProtocolIdentity::default(),
         };
@@ -737,7 +724,11 @@ mod tests {
         let message_nonce: MessageNonce = [52u8; MESSAGE_NONCE_LENGTH];
         let id_nonce_sig = vec![5u8; 64];
         let ephem_pubkey = vec![6u8; 33];
-        let enr_record: Option<Enr> = Some("enr:-IS4QHXuNmr1vGEGVGDcy_sG2BZ7a3A7mbKS812BK_9rToQiF1Lfknsi5o0xKLnGJbTzBssJCzMcIj8SOiu1O9dnfZEBgmlkgnY0gmlwhH8AAAGJc2VjcDI1NmsxoQMT0UIR4Ch7I2GhYViQqbUhIIBUbQoleuTP-Wz1NJksuYN0Y3CCIyg".parse().unwrap());
+        let record_bytes = Some(alloy_rlp::encode(
+            &"enr:-IS4QHXuNmr1vGEGVGDcy_sG2BZ7a3A7mbKS812BK_9rToQiF1Lfknsi5o0xKLnGJbTzBssJCzMcIj8SOiu1O9dnfZEBgmlkgnY0gmlwhH8AAAGJc2VjcDI1NmsxoQMT0UIR4Ch7I2GhYViQqbUhIIBUbQoleuTP-Wz1NJksuYN0Y3CCIyg"
+                .parse::<Enr>()
+                .unwrap(),
+        ));
         let iv = 0u128;
 
         let expected_output = hex::decode("0000000000000000000000000000000035a14bcdb844ae25f36070f07e0b25e765ed72b4d69d137c57dd97a97dd558d1d8e6e6b6fed699e55bb02b47d25562e0a6486ff2aba179f2b8b0770f24d8da18605ff3f5b60b090c61515093a88ef4c02186f7d1b5c9a88fdb8cfae239f13e451758751561b439d8044e27cecdf646f2aa1c9ecbd5faf37eb67a4f6337f4b2a885391e631f72deb808c63bf0b0faed23d7117f7a2e1f98c28bd0e908ce8b51cc89e592ed2efa671b8efd49e1ce8fd567fdb06ed308267d31f6bd75827812d21e8aa5a6c025e69b67faea57a15c1c9324d16938c4ebe71dba0bd5d7b00bb6de3e846ed37ef13a9d2e271f25233f5d97bbb026223dbe6595210f6a11cbee54589a0c0c20c7bb7c4c5bea46553480e1b7d4e83b2dd8305aac3b15fd9b1a1e13fda0").unwrap();
@@ -748,7 +739,7 @@ mod tests {
                 src_id,
                 id_nonce_sig,
                 ephem_pubkey,
-                enr_record,
+                record_bytes,
             },
             protocol_identity: ProtocolIdentity::default(),
         };
@@ -833,15 +824,15 @@ mod tests {
         let message_nonce: MessageNonce = rand::random();
         let id_nonce_sig = vec![13; 64];
         let pubkey = vec![11; 33];
-        let enr_record = None;
+        let record_bytes = None;
 
         let packet = Packet::new_authheader(
             src_id,
             message_nonce,
             ProtocolIdentity::default(),
-            pubkey,
             id_nonce_sig,
-            enr_record,
+            pubkey,
+            record_bytes,
         );
 
         let encoded_packet = packet.clone().encode(&dst_id);
@@ -889,7 +880,7 @@ mod tests {
         let id_nonce_sig = hex_decode("c0a04b36f276172afc66a62848eb0769800c670c4edbefab8f26785e7fda6b56506a3f27ca72a75b106edd392a2cbf8a69272f5c1785c36d1de9d98a0894b2db");
         let ephem_pubkey =
             hex_decode("039a003ba6517b473fa0cd74aefe99dadfdb34627f90fec6362df85803908f53a5");
-        let enr_record = None;
+        let record_bytes = None;
         let iv = 0u128;
 
         let header = PacketHeader {
@@ -898,7 +889,7 @@ mod tests {
                 src_id,
                 id_nonce_sig,
                 ephem_pubkey,
-                enr_record,
+                record_bytes,
             },
             protocol_identity: ProtocolIdentity::default(),
         };
@@ -927,7 +918,11 @@ mod tests {
         let id_nonce_sig = hex_decode("a439e69918e3f53f555d8ca4838fbe8abeab56aa55b056a2ac4d49c157ee719240a93f56c9fccfe7742722a92b3f2dfa27a5452f5aca8adeeab8c4d5d87df555");
         let ephem_pubkey =
             hex_decode("039a003ba6517b473fa0cd74aefe99dadfdb34627f90fec6362df85803908f53a5");
-        let enr_record = Some("enr:-H24QBfhsHORjaMtZAZCx2LA4ngWmOSXH4qzmnd0atrYPwHnb_yHTFkkgIu-fFCJCILCuKASh6CwgxLR1ToX1Rf16ycBgmlkgnY0gmlwhH8AAAGJc2VjcDI1NmsxoQMT0UIR4Ch7I2GhYViQqbUhIIBUbQoleuTP-Wz1NJksuQ".parse::<Enr>().unwrap());
+        let record_bytes = Some(alloy_rlp::encode(
+            &"enr:-H24QBfhsHORjaMtZAZCx2LA4ngWmOSXH4qzmnd0atrYPwHnb_yHTFkkgIu-fFCJCILCuKASh6CwgxLR1ToX1Rf16ycBgmlkgnY0gmlwhH8AAAGJc2VjcDI1NmsxoQMT0UIR4Ch7I2GhYViQqbUhIIBUbQoleuTP-Wz1NJksuQ"
+                .parse::<Enr>()
+                .unwrap(),
+        ));
         let iv = 0u128;
 
         let header = PacketHeader {
@@ -936,7 +931,7 @@ mod tests {
                 src_id,
                 id_nonce_sig,
                 ephem_pubkey,
-                enr_record,
+                record_bytes,
             },
             protocol_identity: ProtocolIdentity::default(),
         };

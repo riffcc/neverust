@@ -115,6 +115,7 @@ impl RecvHandler {
         loop {
             tokio::select! {
                 Ok((length, src)) = self.recv.recv_from(&mut first_buffer) => {
+                    tracing::trace!(src = %src, length, "UDP packet received");
                     METRICS.add_recv_bytes(length);
                     self.handle_inbound(src, length, &first_buffer).await;
                 }

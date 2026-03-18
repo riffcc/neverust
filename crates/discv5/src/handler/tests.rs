@@ -66,6 +66,8 @@ async fn build_handler(
     let (service_send, handler_recv) = mpsc::channel(50);
     let (exit_sender, exit) = oneshot::channel();
 
+    let local_spr = build_local_spr(&enr, &key);
+
     let handler = Handler {
         request_retries: config.request_retries,
         node_id,
@@ -79,11 +81,27 @@ async fn build_handler(
         active_challenges: HashMapDelay::new(config.request_timeout),
         service_recv,
         service_send,
+        local_spr,
         listen_sockets,
         socket,
         exit,
     };
     (exit_sender, handler_send, handler_recv, handler)
+}
+
+#[cfg(feature = "libp2p")]
+#[test]
+fn local_handshake_spr_roundtrips_to_same_node_id() {
+    let ip = "127.0.0.1".parse().unwrap();
+    let key = CombinedKey::generate_secp256k1();
+    let mut enr = Enr::builder().ip4(ip).udp4(9000).build(&key).unwrap();
+    enr.use_archivist_node_id().unwrap();
+
+    let spr = build_local_spr(&enr, &key);
+    assert!(!spr.is_empty(), "local handshake SPR should not be empty");
+
+    let decoded = crate::rpc::enr_from_spr_bytes(&spr).expect("SPR should decode back into ENR");
+    assert_eq!(decoded.node_id(), enr.node_id());
 }
 
 macro_rules! arc_rw {
