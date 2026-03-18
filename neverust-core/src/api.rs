@@ -19,7 +19,7 @@ use tower_http::trace::TraceLayer;
 use tracing::{error, info};
 
 use crate::archivist_tree::ArchivistTree;
-use crate::folder_manifest::{FolderEntry, FolderManifest, FOLDER_MANIFEST_CODEC};
+use crate::folder_manifest::{self, DirectoryEntry, DirectoryManifest, DIRECTORY_CODEC};
 use crate::botg::BoTgProtocol;
 use crate::citadel::{
     run_defederation_simulation, CitadelSyncPullRequest, CitadelSyncPullResponse,
@@ -513,18 +513,10 @@ pub fn create_router_with_runtime(
         .route("/api/archivist/v1/peerid", get(peer_id_endpoint))
         .route("/api/archivist/v1/stats", get(archivist_stats))
         .route("/api/archivist/v1/spr", get(spr_endpoint))
-        // Folder manifest endpoints
+        // Directory manifest endpoint (Archivist-compatible)
         .route(
-            "/api/archivist/v1/folder",
-            post(archivist_create_folder),
-        )
-        .route(
-            "/api/archivist/v1/folder/{cid}",
-            get(archivist_list_folder),
-        )
-        .route(
-            "/api/archivist/v1/stream/{folder_cid}/{filename}",
-            get(archivist_stream_folder_file),
+            "/api/archivist/v1/directory",
+            post(archivist_create_directory),
         )
         // IPFS Cluster-style compatibility endpoints
         .route("/api/ipfs-cluster/v1/pins", get(ipfs_cluster_list_pins))
@@ -1128,15 +1120,82 @@ async fn archivist_list_data(State(state): State<ApiState>) -> impl IntoResponse
 }
 
 /// Archivist local download endpoint (GET /api/archivist/v1/data/:cid)
+///
+/// If the CID is a directory manifest (codec 0xcd04), returns an HTML directory
+/// listing (or JSON if Accept header requests it). Otherwise streams the file.
 async fn archivist_download_local(
     State(state): State<ApiState>,
+    headers: HeaderMap,
     Path(cid_str): Path<String>,
-) -> Result<Vec<u8>, ApiError> {
-    let cid = cid_str
+) -> Result<Response, ApiError> {
+    let cid: Cid = cid_str
         .parse()
         .map_err(|e| ApiError::BadRequest(format!("Invalid CID: {}", e)))?;
 
-    retrieve_local_cid_data(&state, &cid, &cid_str).await
+    // Directory manifests get special treatment
+    if folder_manifest::is_directory(&cid) {
+        let block = state.block_store.get(&cid).await.map_err(|e| match e {
+            StorageError::BlockNotFound(_) => ApiError::NotFound(cid_str.clone()),
+            _ => ApiError::Internal(format!("Failed to retrieve block: {}", e)),
+        })?;
+
+        let directory = DirectoryManifest::from_block(&block)
+            .map_err(|e| ApiError::Internal(format!("Failed to decode directory: {}", e)))?;
+
+        let accept = headers
+            .get("accept")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("*/*");
+
+        if accept.contains("application/json") && !accept.contains("text/html") {
+            // JSON response
+            let entries: Vec<serde_json::Value> = directory
+                .entries
+                .iter()
+                .map(|e| {
+                    let mut obj = json!({
+                        "name": e.name,
+                        "cid": e.cid.to_string(),
+                        "size": e.size,
+                        "isDirectory": e.is_directory,
+                    });
+                    if !e.mimetype.is_empty() {
+                        obj["mimetype"] = json!(e.mimetype);
+                    }
+                    obj
+                })
+                .collect();
+
+            let body = json!({
+                "cid": cid_str,
+                "name": directory.name,
+                "totalSize": directory.total_size,
+                "entries": entries,
+            });
+
+            return Response::builder()
+                .status(StatusCode::OK)
+                .header("Content-Type", "application/json")
+                .body(Body::from(serde_json::to_string(&body).unwrap()))
+                .map_err(|e| ApiError::Internal(format!("Response build error: {}", e)));
+        }
+
+        // HTML directory listing
+        let html = generate_directory_html(&directory, &cid);
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", "text/html; charset=utf-8")
+            .body(Body::from(html))
+            .map_err(|e| ApiError::Internal(format!("Response build error: {}", e)));
+    }
+
+    // Regular file — stream it
+    let data = retrieve_local_cid_data(&state, &cid, &cid_str).await?;
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("Content-Type", "application/octet-stream")
+        .body(Body::from(data))
+        .map_err(|e| ApiError::Internal(format!("Response build error: {}", e)))
 }
 
 /// Archivist delete endpoint (DELETE /api/archivist/v1/data/:cid)
@@ -1995,12 +2054,12 @@ async fn spr_endpoint(State(state): State<ApiState>) -> Result<String, ApiError>
     Ok(spr)
 }
 
-// --- Folder manifest types and handlers ---
+// --- Directory manifest types and handlers (Archivist-compatible) ---
 
 #[derive(Deserialize)]
-struct CreateFolderEntryRequest {
-    name: String,
-    manifest_cid: String,
+struct CreateDirectoryEntryRequest {
+    path: String,
+    cid: String,
     #[serde(default)]
     size: Option<u64>,
     #[serde(default)]
@@ -2008,202 +2067,352 @@ struct CreateFolderEntryRequest {
 }
 
 #[derive(Deserialize)]
-struct CreateFolderRequest {
-    entries: Vec<CreateFolderEntryRequest>,
+struct CreateDirectoryRequest {
+    entries: Vec<CreateDirectoryEntryRequest>,
+    #[serde(default)]
+    name: Option<String>,
 }
 
-#[derive(Serialize)]
-struct FolderEntryResponse {
-    name: String,
-    manifest_cid: String,
-    size: u64,
-    mimetype: String,
-}
-
-#[derive(Serialize)]
-struct FolderResponse {
-    cid: String,
-    entries: Vec<FolderEntryResponse>,
-}
-
-/// Create a folder manifest from a list of file manifest CIDs.
+/// Finalize a directory from pre-uploaded files (Archivist-compatible).
 ///
-/// POST /api/archivist/v1/folder
-async fn archivist_create_folder(
+/// POST /api/archivist/v1/directory
+///
+/// Accepts JSON with `entries` array, each containing `path`, `cid`, `size`, `mimetype`.
+/// Paths like "Album/track.mp3" create nested directory structures.
+/// Returns JSON with root directory CID.
+async fn archivist_create_directory(
     State(state): State<ApiState>,
-    Json(req): Json<CreateFolderRequest>,
-) -> Result<Json<FolderResponse>, ApiError> {
+    Json(req): Json<CreateDirectoryRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
     if req.entries.is_empty() {
-        return Err(ApiError::BadRequest(
-            "Folder must have at least one entry".to_string(),
-        ));
+        return Err(ApiError::BadRequest("No entries provided".to_string()));
     }
 
-    let mut entries = Vec::with_capacity(req.entries.len());
-    for entry_req in &req.entries {
-        let cid: Cid = entry_req
-            .manifest_cid
-            .parse()
-            .map_err(|e| ApiError::BadRequest(format!("Invalid CID '{}': {}", entry_req.manifest_cid, e)))?;
+    // Parse and validate entries
+    struct InputEntry {
+        path_parts: Vec<String>,
+        cid: Cid,
+        size: u64,
+        mimetype: String,
+    }
 
-        // Try to load the manifest to get size/mimetype, but allow override via request
-        let (size, mimetype) = if let (Some(s), Some(m)) = (entry_req.size, entry_req.mimetype.as_ref()) {
-            (s, m.clone())
+    let mut input_entries = Vec::with_capacity(req.entries.len());
+    for (i, entry) in req.entries.iter().enumerate() {
+        let cid: Cid = entry
+            .cid
+            .parse()
+            .map_err(|e| ApiError::BadRequest(format!("Entry {} invalid CID: {}", i, e)))?;
+
+        // Normalize path
+        let normalized = entry.path.replace('\\', "/");
+        let parts: Vec<String> = normalized
+            .split('/')
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .collect();
+
+        if parts.is_empty() {
+            continue;
+        }
+
+        // Check for directory traversal
+        for part in &parts {
+            if part == ".." {
+                return Err(ApiError::BadRequest(format!(
+                    "Invalid path (directory traversal): {}",
+                    entry.path
+                )));
+            }
+        }
+
+        // Resolve size from manifest if not provided
+        let size = if let Some(s) = entry.size {
+            s
         } else if let Ok(block) = state.block_store.get(&cid).await {
             if cid.codec() == 0xcd01 {
-                if let Ok(manifest) = Manifest::from_block(&block) {
-                    (
-                        entry_req.size.unwrap_or(manifest.dataset_size),
-                        entry_req.mimetype.clone().unwrap_or_else(|| {
-                            manifest.mimetype.unwrap_or_default()
-                        }),
-                    )
-                } else {
-                    (entry_req.size.unwrap_or(block.data.len() as u64), entry_req.mimetype.clone().unwrap_or_default())
-                }
+                Manifest::from_block(&block)
+                    .map(|m| m.dataset_size)
+                    .unwrap_or(block.data.len() as u64)
             } else {
-                (entry_req.size.unwrap_or(block.data.len() as u64), entry_req.mimetype.clone().unwrap_or_default())
+                block.data.len() as u64
             }
         } else {
-            // CID not stored locally — use provided values or defaults
-            (entry_req.size.unwrap_or(0), entry_req.mimetype.clone().unwrap_or_default())
+            0
         };
 
-        entries.push(FolderEntry {
-            name: entry_req.name.clone(),
-            manifest_cid: cid,
+        input_entries.push(InputEntry {
+            path_parts: parts,
+            cid,
             size,
-            mimetype,
+            mimetype: entry.mimetype.clone().unwrap_or_default(),
         });
     }
 
-    let folder = FolderManifest::new(entries);
-    let block = folder
-        .to_block()
-        .map_err(|e| ApiError::Internal(format!("Failed to create folder block: {}", e)))?;
-
-    let folder_cid = block.cid;
-    let folder_cid_str = folder_cid.to_string();
-
-    state
-        .block_store
-        .put(block)
-        .await
-        .map_err(|e| ApiError::Internal(format!("Failed to store folder block: {}", e)))?;
-
-    info!("Created folder manifest {} with {} entries", folder_cid_str, folder.entries.len());
-
-    let response_entries = folder
-        .entries
-        .iter()
-        .map(|e| FolderEntryResponse {
-            name: e.name.clone(),
-            manifest_cid: e.manifest_cid.to_string(),
-            size: e.size,
-            mimetype: e.mimetype.clone(),
-        })
-        .collect();
-
-    Ok(Json(FolderResponse {
-        cid: folder_cid_str,
-        entries: response_entries,
-    }))
-}
-
-/// List entries in a folder manifest.
-///
-/// GET /api/archivist/v1/folder/:cid
-async fn archivist_list_folder(
-    State(state): State<ApiState>,
-    Path(cid_str): Path<String>,
-) -> Result<Json<FolderResponse>, ApiError> {
-    let cid: Cid = cid_str
-        .parse()
-        .map_err(|e| ApiError::BadRequest(format!("Invalid CID: {}", e)))?;
-
-    let block = state.block_store.get(&cid).await.map_err(|e| match e {
-        StorageError::BlockNotFound(_) => ApiError::NotFound(cid_str.clone()),
-        _ => ApiError::Internal(format!("Failed to retrieve block: {}", e)),
-    })?;
-
-    if cid.codec() != FOLDER_MANIFEST_CODEC {
-        return Err(ApiError::BadRequest(format!(
-            "CID {} is not a folder manifest (codec 0x{:x}, expected 0x{:x})",
-            cid_str,
-            cid.codec(),
-            FOLDER_MANIFEST_CODEC
-        )));
+    // Build directory tree
+    struct DirNode {
+        name: String,
+        files: Vec<(String, Cid, u64, String)>, // (name, cid, size, mimetype)
+        subdirs: std::collections::BTreeMap<String, DirNode>,
     }
 
-    let folder = FolderManifest::from_block(&block)
-        .map_err(|e| ApiError::Internal(format!("Failed to decode folder manifest: {}", e)))?;
-
-    let entries = folder
-        .entries
-        .iter()
-        .map(|e| FolderEntryResponse {
-            name: e.name.clone(),
-            manifest_cid: e.manifest_cid.to_string(),
-            size: e.size,
-            mimetype: e.mimetype.clone(),
-        })
-        .collect();
-
-    Ok(Json(FolderResponse {
-        cid: cid_str,
-        entries,
-    }))
-}
-
-/// Stream a single file from a folder manifest by filename.
-///
-/// GET /api/archivist/v1/stream/:folder_cid/:filename
-async fn archivist_stream_folder_file(
-    State(state): State<ApiState>,
-    Path((folder_cid_str, filename)): Path<(String, String)>,
-) -> Result<Response, ApiError> {
-    let folder_cid: Cid = folder_cid_str
-        .parse()
-        .map_err(|e| ApiError::BadRequest(format!("Invalid folder CID: {}", e)))?;
-
-    let folder_block = state
-        .block_store
-        .get(&folder_cid)
-        .await
-        .map_err(|e| match e {
-            StorageError::BlockNotFound(_) => ApiError::NotFound(folder_cid_str.clone()),
-            _ => ApiError::Internal(format!("Failed to retrieve folder block: {}", e)),
-        })?;
-
-    let folder = FolderManifest::from_block(&folder_block)
-        .map_err(|e| ApiError::Internal(format!("Failed to decode folder manifest: {}", e)))?;
-
-    let entry = folder.find_entry(&filename).ok_or_else(|| {
-        ApiError::NotFound(format!(
-            "File '{}' not found in folder {}",
-            filename, folder_cid_str
-        ))
-    })?;
-
-    let manifest_cid_str = entry.manifest_cid.to_string();
-    let data = retrieve_local_cid_data(&state, &entry.manifest_cid, &manifest_cid_str).await?;
-
-    let content_type = if entry.mimetype.is_empty() {
-        "application/octet-stream"
-    } else {
-        &entry.mimetype
+    let mut root = DirNode {
+        name: req.name.unwrap_or_default(),
+        files: Vec::new(),
+        subdirs: std::collections::BTreeMap::new(),
     };
 
-    Response::builder()
-        .status(StatusCode::OK)
-        .header("Content-Type", content_type)
-        .header(
-            "Content-Disposition",
-            format!("inline; filename=\"{}\"", filename),
-        )
-        .header("Content-Length", data.len().to_string())
-        .body(Body::from(data))
-        .map_err(|e| ApiError::Internal(format!("Failed to build response: {}", e)))
+    for entry in &input_entries {
+        let mut current = &mut root;
+
+        // Navigate/create directory structure for all but the last component
+        for part in &entry.path_parts[..entry.path_parts.len() - 1] {
+            current = current
+                .subdirs
+                .entry(part.clone())
+                .or_insert_with(|| DirNode {
+                    name: part.clone(),
+                    files: Vec::new(),
+                    subdirs: std::collections::BTreeMap::new(),
+                });
+        }
+
+        // Last component is the file
+        let filename = entry.path_parts.last().unwrap().clone();
+        current.files.push((filename, entry.cid, entry.size, entry.mimetype.clone()));
+    }
+
+    // If root has exactly one subdir and no files, promote it
+    while root.subdirs.len() == 1 && root.files.is_empty() {
+        let (_, subdir) = root.subdirs.into_iter().next().unwrap();
+        root = subdir;
+    }
+
+    // Flatten the tree into directory manifests, bottom-up.
+    // We use an iterative approach to avoid async recursion lifetime issues.
+    // First, collect all leaf directories (no subdirs), create their manifests,
+    // then work upwards.
+    async fn build_dir_tree(
+        root: DirNode,
+        block_store: Arc<BlockStore>,
+    ) -> std::result::Result<(Cid, u64), ApiError> {
+        // Simple recursive approach using boxed futures with owned data
+        struct OwnedDirNode {
+            name: String,
+            files: Vec<(String, Cid, u64, String)>,
+            subdirs: Vec<(String, OwnedDirNode)>,
+        }
+
+        fn convert(node: DirNode) -> OwnedDirNode {
+            OwnedDirNode {
+                name: node.name,
+                files: node.files,
+                subdirs: node.subdirs.into_iter().map(|(k, v)| (k, convert(v))).collect(),
+            }
+        }
+
+        fn build_inner(
+            node: OwnedDirNode,
+            block_store: Arc<BlockStore>,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::result::Result<(Cid, u64), ApiError>> + Send>> {
+            Box::pin(async move {
+                let mut entries = Vec::new();
+
+                for (name, subdir) in node.subdirs {
+                    let (sub_cid, sub_size) = build_inner(subdir, block_store.clone()).await?;
+                    entries.push(DirectoryEntry {
+                        name,
+                        cid: sub_cid,
+                        size: sub_size,
+                        is_directory: true,
+                        mimetype: String::new(),
+                    });
+                }
+
+                for (name, cid, size, mimetype) in node.files {
+                    entries.push(DirectoryEntry {
+                        name,
+                        cid,
+                        size,
+                        is_directory: false,
+                        mimetype,
+                    });
+                }
+
+                entries.sort_by(|a, b| match (a.is_directory, b.is_directory) {
+                    (true, false) => std::cmp::Ordering::Less,
+                    (false, true) => std::cmp::Ordering::Greater,
+                    _ => a.name.cmp(&b.name),
+                });
+
+                let dir = DirectoryManifest::new(entries, node.name);
+                let total_size = dir.total_size;
+                let block = dir
+                    .to_block()
+                    .map_err(|e| ApiError::Internal(format!("Failed to create directory block: {}", e)))?;
+
+                let cid = block.cid;
+                block_store
+                    .put(block)
+                    .await
+                    .map_err(|e| ApiError::Internal(format!("Failed to store directory block: {}", e)))?;
+
+                Ok((cid, total_size))
+            })
+        }
+
+        let owned = convert(root);
+        build_inner(owned, block_store).await
+    }
+
+    let (root_cid, total_size) = build_dir_tree(root, state.block_store.clone()).await?;
+
+    info!(
+        "Created directory manifest {} ({} entries, {} bytes)",
+        root_cid,
+        input_entries.len(),
+        total_size
+    );
+
+    Ok(Json(json!({
+        "cid": root_cid.to_string(),
+        "totalSize": total_size,
+        "filesCount": input_entries.len(),
+    })))
+}
+
+/// Generate an HTML directory listing page.
+fn generate_directory_html(directory: &DirectoryManifest, dir_cid: &Cid) -> String {
+    let cid_str = dir_cid.to_string();
+    let dir_name = if directory.name.is_empty() {
+        &cid_str[..12.min(cid_str.len())]
+    } else {
+        &directory.name
+    };
+
+    let mut rows = String::new();
+    for entry in directory.sorted_entries() {
+        let icon = if entry.is_directory {
+            "&#128193;"
+        } else if entry.mimetype.starts_with("audio/") {
+            "&#127925;"
+        } else if entry.mimetype.starts_with("video/") {
+            "&#127909;"
+        } else if entry.mimetype.starts_with("image/") {
+            "&#128247;"
+        } else if entry.mimetype == "application/pdf" {
+            "&#128213;"
+        } else {
+            "&#128196;"
+        };
+
+        let entry_cid = entry.cid.to_string();
+        let size_str = format_size(entry.size);
+        let display_name = if entry.is_directory {
+            format!("{}/", html_escape(&entry.name))
+        } else {
+            html_escape(&entry.name)
+        };
+
+        rows.push_str(&format!(
+            r#"<div class="file-row">
+  <div class="file-name"><span class="file-icon">{icon}</span><a href="/api/archivist/v1/data/{entry_cid}">{display_name}</a></div>
+  <div class="file-cid"><a href="/api/archivist/v1/data/{entry_cid}" title="{entry_cid}">{short_cid}</a></div>
+  <div class="file-size">{size_str}</div>
+</div>
+"#,
+            icon = icon,
+            entry_cid = entry_cid,
+            display_name = display_name,
+            short_cid = &entry_cid[..16.min(entry_cid.len())],
+            size_str = size_str,
+        ));
+    }
+
+    let total_str = format_size(directory.total_size);
+    format!(
+        r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Index of {dir_name} - Archivist</title>
+<style>
+:root {{ --bg-primary: #0d1117; --bg-secondary: #161b22; --bg-tertiary: #21262d;
+  --text-primary: #c9d1d9; --text-secondary: #8b949e; --accent: #00ff41;
+  --link: #58a6ff; --border: #30363d; }}
+* {{ box-sizing: border-box; margin: 0; padding: 0; }}
+body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+  background: var(--bg-primary); color: var(--text-primary); line-height: 1.5; }}
+.container {{ max-width: 1200px; margin: 0 auto; padding: 0 16px; }}
+header {{ background: var(--bg-secondary); border-bottom: 1px solid var(--border); padding: 16px 0; }}
+.logo {{ color: var(--accent); font-weight: 600; font-size: 18px; text-decoration: none; }}
+main {{ padding: 24px 0; }}
+.dir-info {{ background: var(--bg-secondary); border: 1px solid var(--border); border-radius: 6px; padding: 16px; margin-bottom: 16px; }}
+.dir-info h1 {{ font-size: 20px; font-weight: 600; margin-bottom: 8px; }}
+.dir-meta {{ font-size: 13px; color: var(--text-secondary); font-family: monospace; }}
+.dir-meta a {{ color: var(--link); text-decoration: none; }}
+.file-list {{ background: var(--bg-secondary); border: 1px solid var(--border); border-radius: 6px; overflow: hidden; }}
+.file-list-header, .file-row {{ display: grid; grid-template-columns: 1fr 200px 100px; gap: 16px; padding: 10px 16px; }}
+.file-list-header {{ background: var(--bg-tertiary); border-bottom: 1px solid var(--border); font-size: 12px; font-weight: 600; color: var(--text-secondary); text-transform: uppercase; }}
+.file-row {{ border-bottom: 1px solid var(--border); font-size: 14px; }}
+.file-row:last-child {{ border-bottom: none; }}
+.file-row:hover {{ background: var(--bg-tertiary); }}
+.file-name {{ display: flex; align-items: center; gap: 8px; min-width: 0; }}
+.file-name a {{ color: var(--link); text-decoration: none; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
+.file-name a:hover {{ text-decoration: underline; }}
+.file-icon {{ flex-shrink: 0; }}
+.file-cid {{ font-family: monospace; font-size: 12px; color: var(--text-secondary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
+.file-cid a {{ color: var(--text-secondary); text-decoration: none; }}
+.file-size {{ text-align: right; color: var(--text-secondary); font-family: monospace; font-size: 13px; }}
+footer {{ padding: 24px 0; text-align: center; color: var(--text-secondary); font-size: 12px; border-top: 1px solid var(--border); margin-top: 48px; }}
+footer a {{ color: var(--accent); text-decoration: none; }}
+@media (max-width: 768px) {{ .file-list-header, .file-row {{ grid-template-columns: 1fr 80px; }} .file-cid {{ display: none; }} }}
+</style>
+</head>
+<body>
+<header><div class="container"><a href="/" class="logo">Archivist</a></div></header>
+<main><div class="container">
+  <div class="dir-info">
+    <h1>&#128193; Index of {dir_name}</h1>
+    <div class="dir-meta">
+      CID: <a href="/api/archivist/v1/data/{cid_str}">{cid_str}</a>
+      &bull; {entry_count} items &bull; {total_str}
+    </div>
+  </div>
+  <div class="file-list">
+    <div class="file-list-header"><span>Name</span><span>CID</span><span style="text-align:right">Size</span></div>
+    {rows}
+  </div>
+</div></main>
+<footer><div class="container">Served by <a href="https://archivist.storage">Archivist</a> / <a href="https://riff.cc">Neverust</a></div></footer>
+</body>
+</html>"#,
+        dir_name = html_escape(dir_name),
+        cid_str = cid_str,
+        entry_count = directory.entries.len(),
+        total_str = total_str,
+        rows = rows,
+    )
+}
+
+fn format_size(bytes: u64) -> String {
+    if bytes < 1024 {
+        format!("{} B", bytes)
+    } else if bytes < 1024 * 1024 {
+        format!("{:.1} KB", bytes as f64 / 1024.0)
+    } else if bytes < 1024 * 1024 * 1024 {
+        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+    } else {
+        format!("{:.2} GB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
+    }
+}
+
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
 }
 
 /// API error type

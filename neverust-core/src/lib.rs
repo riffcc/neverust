@@ -48,7 +48,7 @@ pub use cluster::{select_replicas, upload_path_for_cid_str, ClusterNode};
 pub use config::Config;
 pub use eth_key::{load_or_generate as load_or_generate_eth_key, EthKey, EthKeyError};
 pub use folder_manifest::{
-    FolderEntry, FolderManifest, FolderManifestError, FOLDER_MANIFEST_CODEC,
+    is_directory, DirectoryEntry, DirectoryManifest, DirectoryManifestError, DIRECTORY_CODEC,
 };
 pub use discovery::{Discovery, DiscoveryError, DiscoveryStats};
 pub use manifest::{

@@ -1,7 +1,12 @@
-//! Folder Manifest implementation
+//! Directory Manifest implementation (Archivist-compatible)
 //!
-//! Folder manifests (codec 0xcd03) group multiple file manifests into a named
-//! directory structure. Each entry maps a filename to its file manifest CID.
+//! Directory manifests (codec 0xcd04) group multiple content entries into a
+//! named directory structure. Compatible with the Archivist `DirectoryCodec`.
+//!
+//! Protobuf layout matches the Archivist reference implementation:
+//!   - Field 1 (repeated): entries (each a nested protobuf with name/cid/size/isDirectory/mimetype)
+//!   - Field 2: totalSize (uint64)
+//!   - Field 3: name (string)
 
 use cid::Cid;
 use prost::Message as ProstMessage;
@@ -9,14 +14,18 @@ use sha2::{Digest, Sha256};
 use std::io::Cursor;
 use thiserror::Error;
 
-use crate::manifest::{BLAKE3_CODEC, SHA256_CODEC};
+use crate::manifest::SHA256_CODEC;
+
+// Re-export for test use
+#[cfg(test)]
+use crate::manifest::BLAKE3_CODEC;
 use crate::storage::Block;
 
-/// Folder manifest codec (0xcd03)
-pub const FOLDER_MANIFEST_CODEC: u64 = 0xcd03;
+/// Directory manifest codec (0xcd04) — matches Archivist DirectoryCodec.
+pub const DIRECTORY_CODEC: u64 = 0xcd04;
 
 #[derive(Debug, Error)]
-pub enum FolderManifestError {
+pub enum DirectoryManifestError {
     #[error("Protobuf encode error: {0}")]
     EncodeError(#[from] prost::EncodeError),
 
@@ -26,98 +35,112 @@ pub enum FolderManifestError {
     #[error("CID error: {0}")]
     CidError(String),
 
-    #[error("Invalid folder manifest: {0}")]
+    #[error("Invalid directory manifest: {0}")]
     InvalidManifest(String),
-
-    #[error("Multihash error: {0}")]
-    MultihashError(String),
 }
 
-pub type Result<T> = std::result::Result<T, FolderManifestError>;
+pub type Result<T> = std::result::Result<T, DirectoryManifestError>;
 
-/// A single file entry within a folder.
+/// A single entry within a directory.
 #[derive(Debug, Clone, PartialEq)]
-pub struct FolderEntry {
-    /// Filename within the folder.
+pub struct DirectoryEntry {
+    /// Name of this entry (filename or subdirectory name).
     pub name: String,
-    /// CID of the file's Manifest block (codec 0xcd01).
-    pub manifest_cid: Cid,
-    /// Total file size in bytes (from the inner manifest's dataset_size).
+    /// CID of the content (file manifest 0xcd01 or nested directory 0xcd04).
+    pub cid: Cid,
+    /// Total size in bytes.
     pub size: u64,
+    /// Whether this entry is a subdirectory.
+    pub is_directory: bool,
     /// MIME type (empty string if unset).
     pub mimetype: String,
 }
 
-/// A folder manifest grouping multiple file manifests under named entries.
+/// A directory manifest grouping entries under a named directory.
 #[derive(Debug, Clone, PartialEq)]
-pub struct FolderManifest {
-    pub entries: Vec<FolderEntry>,
-    /// Multihash codec (default: BLAKE3).
-    pub hcodec: u64,
-    /// CID version (default: 1).
-    pub version: u32,
+pub struct DirectoryManifest {
+    pub entries: Vec<DirectoryEntry>,
+    /// Total size of all entries.
+    pub total_size: u64,
+    /// Directory name (empty string if unset).
+    pub name: String,
 }
 
-impl FolderManifest {
-    /// Create a new folder manifest with default hcodec (BLAKE3) and version (1).
-    pub fn new(entries: Vec<FolderEntry>) -> Self {
+impl DirectoryManifest {
+    /// Create a new directory manifest, computing total_size from entries.
+    pub fn new(entries: Vec<DirectoryEntry>, name: String) -> Self {
+        let total_size = entries.iter().map(|e| e.size).sum();
         Self {
             entries,
-            hcodec: BLAKE3_CODEC,
-            version: 1,
+            total_size,
+            name,
         }
     }
 
-    /// Look up an entry by filename.
-    pub fn find_entry(&self, name: &str) -> Option<&FolderEntry> {
+    /// Look up an entry by name.
+    pub fn find_entry(&self, name: &str) -> Option<&DirectoryEntry> {
         self.entries.iter().find(|e| e.name == name)
     }
 
-    /// Encode the folder manifest to protobuf bytes.
+    /// Return entries sorted: directories first, then files, alphabetically.
+    pub fn sorted_entries(&self) -> Vec<&DirectoryEntry> {
+        let mut sorted: Vec<&DirectoryEntry> = self.entries.iter().collect();
+        sorted.sort_by(|a, b| {
+            match (a.is_directory, b.is_directory) {
+                (true, false) => std::cmp::Ordering::Less,
+                (false, true) => std::cmp::Ordering::Greater,
+                _ => a.name.cmp(&b.name),
+            }
+        });
+        sorted
+    }
+
+    /// Encode the directory manifest to protobuf bytes.
+    ///
+    /// Layout matches Archivist:
+    ///   Field 1 (repeated): serialized entry sub-messages
+    ///   Field 2: totalSize
+    ///   Field 3: name
     pub fn encode(&self) -> Result<Vec<u8>> {
-        let entries: Vec<proto::FolderEntryProto> = self
+        let entries: Vec<proto::DirectoryEntryProto> = self
             .entries
             .iter()
-            .map(|e| proto::FolderEntryProto {
+            .map(|e| proto::DirectoryEntryProto {
                 name: e.name.clone(),
-                manifest_cid: e.manifest_cid.to_bytes(),
+                cid: e.cid.to_bytes(),
                 size: e.size,
+                is_directory: if e.is_directory { 1 } else { 0 },
                 mimetype: e.mimetype.clone(),
             })
             .collect();
 
-        let header = proto::FolderHeader {
+        let header = proto::DirectoryHeader {
             entries,
-            hcodec: self.hcodec as u32,
-            version: self.version,
+            total_size: self.total_size,
+            name: self.name.clone(),
         };
 
         let mut buf = Vec::new();
         header.encode(&mut buf)?;
-
-        let mut result = Vec::new();
-        let pb_node = proto::DagPbNode { data: buf };
-        pb_node.encode(&mut result)?;
-
-        Ok(result)
+        Ok(buf)
     }
 
-    /// Decode a folder manifest from protobuf bytes.
+    /// Decode a directory manifest from protobuf bytes.
     pub fn decode(data: &[u8]) -> Result<Self> {
-        let pb_node = proto::DagPbNode::decode(&mut Cursor::new(data))?;
-        let header = proto::FolderHeader::decode(&mut Cursor::new(pb_node.data))?;
+        let header = proto::DirectoryHeader::decode(&mut Cursor::new(data))?;
 
-        let entries: Result<Vec<FolderEntry>> = header
+        let entries: Result<Vec<DirectoryEntry>> = header
             .entries
             .into_iter()
             .map(|e| {
-                let manifest_cid = Cid::try_from(e.manifest_cid).map_err(|err| {
-                    FolderManifestError::CidError(format!("Invalid manifest CID: {}", err))
+                let cid = Cid::try_from(e.cid).map_err(|err| {
+                    DirectoryManifestError::CidError(format!("Invalid CID: {}", err))
                 })?;
-                Ok(FolderEntry {
+                Ok(DirectoryEntry {
                     name: e.name,
-                    manifest_cid,
+                    cid,
                     size: e.size,
+                    is_directory: e.is_directory != 0,
                     mimetype: e.mimetype,
                 })
             })
@@ -125,98 +148,100 @@ impl FolderManifest {
 
         Ok(Self {
             entries: entries?,
-            hcodec: header.hcodec as u64,
-            version: header.version,
+            total_size: header.total_size,
+            name: header.name,
         })
     }
 
-    /// Create a Block from this folder manifest.
+    /// Create a Block from this directory manifest.
     ///
-    /// The block will have codec 0xcd03 (FolderManifestCodec).
+    /// Uses SHA-256 hashing to match Archivist convention for directory blocks.
     pub fn to_block(&self) -> Result<Block> {
         let data = self.encode()?;
 
-        let hash_bytes = match self.hcodec {
-            BLAKE3_CODEC => blake3::hash(&data).as_bytes().to_vec(),
-            SHA256_CODEC => {
-                let mut hasher = Sha256::new();
-                hasher.update(&data);
-                hasher.finalize().to_vec()
-            }
-            codec => {
-                return Err(FolderManifestError::InvalidManifest(format!(
-                    "Unsupported hash codec: 0x{:x}",
-                    codec
-                )))
-            }
+        // Archivist uses SHA-256 for directory manifests
+        let hcodec = SHA256_CODEC;
+        let hash_bytes = {
+            let mut hasher = Sha256::new();
+            hasher.update(&data);
+            hasher.finalize().to_vec()
         };
 
         // Build multihash
         let mut multihash = Vec::new();
         let mut buf = [0u8; 10];
-        let encoded = unsigned_varint::encode::u64(self.hcodec, &mut buf);
+        let encoded = unsigned_varint::encode::u64(hcodec, &mut buf);
         multihash.extend_from_slice(encoded);
         let encoded = unsigned_varint::encode::u64(hash_bytes.len() as u64, &mut buf);
         multihash.extend_from_slice(encoded);
         multihash.extend_from_slice(&hash_bytes);
 
-        // Build CID
+        // Build CID (version 1, DirectoryCodec)
         let mut cid_bytes = Vec::new();
-        let encoded = unsigned_varint::encode::u64(self.version as u64, &mut buf);
+        let encoded = unsigned_varint::encode::u64(1, &mut buf);
         cid_bytes.extend_from_slice(encoded);
-        let encoded = unsigned_varint::encode::u64(FOLDER_MANIFEST_CODEC, &mut buf);
+        let encoded = unsigned_varint::encode::u64(DIRECTORY_CODEC, &mut buf);
         cid_bytes.extend_from_slice(encoded);
         cid_bytes.extend_from_slice(&multihash);
 
         let cid = Cid::try_from(cid_bytes)
-            .map_err(|e| FolderManifestError::CidError(format!("Failed to create CID: {}", e)))?;
+            .map_err(|e| DirectoryManifestError::CidError(format!("Failed to create CID: {}", e)))?;
 
         Ok(Block { cid, data })
     }
 
-    /// Create a folder manifest from a Block.
+    /// Create a directory manifest from a Block.
     pub fn from_block(block: &Block) -> Result<Self> {
         let codec = block.cid.codec();
-        if codec != FOLDER_MANIFEST_CODEC {
-            return Err(FolderManifestError::InvalidManifest(format!(
-                "Block has codec 0x{:x}, expected folder manifest codec 0x{:x}",
-                codec, FOLDER_MANIFEST_CODEC
+        if codec != DIRECTORY_CODEC {
+            return Err(DirectoryManifestError::InvalidManifest(format!(
+                "Block has codec 0x{:x}, expected directory codec 0x{:x}",
+                codec, DIRECTORY_CODEC
             )));
         }
         Self::decode(&block.data)
     }
 }
 
-/// Protobuf message definitions.
+/// Check whether a CID represents a directory manifest.
+pub fn is_directory(cid: &Cid) -> bool {
+    cid.codec() == DIRECTORY_CODEC
+}
+
+/// Protobuf message definitions matching Archivist layout.
 mod proto {
     use prost::Message;
 
     #[derive(Clone, PartialEq, Message)]
-    pub struct DagPbNode {
-        #[prost(bytes, tag = "1")]
-        pub data: Vec<u8>,
-    }
-
-    #[derive(Clone, PartialEq, Message)]
-    pub struct FolderEntryProto {
+    pub struct DirectoryEntryProto {
+        /// Entry name
         #[prost(string, tag = "1")]
         pub name: String,
+        /// CID bytes
         #[prost(bytes, tag = "2")]
-        pub manifest_cid: Vec<u8>,
+        pub cid: Vec<u8>,
+        /// Size in bytes
         #[prost(uint64, tag = "3")]
         pub size: u64,
-        #[prost(string, tag = "4")]
+        /// 1 = directory, 0 = file
+        #[prost(uint32, tag = "4")]
+        pub is_directory: u32,
+        /// MIME type (optional, empty = unset)
+        #[prost(string, tag = "5")]
         pub mimetype: String,
     }
 
     #[derive(Clone, PartialEq, Message)]
-    pub struct FolderHeader {
+    pub struct DirectoryHeader {
+        /// Repeated directory entries
         #[prost(message, repeated, tag = "1")]
-        pub entries: Vec<FolderEntryProto>,
-        #[prost(uint32, tag = "2")]
-        pub hcodec: u32,
-        #[prost(uint32, tag = "3")]
-        pub version: u32,
+        pub entries: Vec<DirectoryEntryProto>,
+        /// Total size of all entries
+        #[prost(uint64, tag = "2")]
+        pub total_size: u64,
+        /// Directory name
+        #[prost(string, tag = "3")]
+        pub name: String,
     }
 }
 
@@ -248,103 +273,153 @@ mod tests {
     }
 
     #[test]
-    fn test_folder_manifest_roundtrip() {
+    fn test_directory_manifest_roundtrip() {
         let cid1 = create_test_cid(b"file1", MANIFEST_CODEC);
         let cid2 = create_test_cid(b"file2", MANIFEST_CODEC);
 
-        let folder = FolderManifest::new(vec![
-            FolderEntry {
-                name: "01 - Track One.flac".to_string(),
-                manifest_cid: cid1,
-                size: 27_000_000,
-                mimetype: "audio/flac".to_string(),
-            },
-            FolderEntry {
-                name: "02 - Track Two.flac".to_string(),
-                manifest_cid: cid2,
-                size: 102_000_000,
-                mimetype: "audio/flac".to_string(),
-            },
-        ]);
+        let dir = DirectoryManifest::new(
+            vec![
+                DirectoryEntry {
+                    name: "01 - Track One.flac".to_string(),
+                    cid: cid1,
+                    size: 27_000_000,
+                    is_directory: false,
+                    mimetype: "audio/flac".to_string(),
+                },
+                DirectoryEntry {
+                    name: "02 - Track Two.flac".to_string(),
+                    cid: cid2,
+                    size: 102_000_000,
+                    is_directory: false,
+                    mimetype: "audio/flac".to_string(),
+                },
+            ],
+            "The Slip".to_string(),
+        );
 
-        let encoded = folder.encode().expect("encode should succeed");
-        let decoded = FolderManifest::decode(&encoded).expect("decode should succeed");
+        assert_eq!(dir.total_size, 129_000_000);
+
+        let encoded = dir.encode().expect("encode should succeed");
+        let decoded = DirectoryManifest::decode(&encoded).expect("decode should succeed");
 
         assert_eq!(decoded.entries.len(), 2);
+        assert_eq!(decoded.name, "The Slip");
+        assert_eq!(decoded.total_size, 129_000_000);
         assert_eq!(decoded.entries[0].name, "01 - Track One.flac");
-        assert_eq!(decoded.entries[0].manifest_cid, cid1);
-        assert_eq!(decoded.entries[0].size, 27_000_000);
+        assert_eq!(decoded.entries[0].cid, cid1);
+        assert_eq!(decoded.entries[0].is_directory, false);
         assert_eq!(decoded.entries[1].name, "02 - Track Two.flac");
-        assert_eq!(decoded.entries[1].manifest_cid, cid2);
     }
 
     #[test]
-    fn test_folder_manifest_to_block() {
+    fn test_directory_manifest_to_block() {
         let cid1 = create_test_cid(b"file1", MANIFEST_CODEC);
-        let folder = FolderManifest::new(vec![FolderEntry {
-            name: "test.bin".to_string(),
-            manifest_cid: cid1,
-            size: 1024,
-            mimetype: "application/octet-stream".to_string(),
-        }]);
+        let dir = DirectoryManifest::new(
+            vec![DirectoryEntry {
+                name: "test.bin".to_string(),
+                cid: cid1,
+                size: 1024,
+                is_directory: false,
+                mimetype: "application/octet-stream".to_string(),
+            }],
+            "".to_string(),
+        );
 
-        let block = folder.to_block().expect("to_block should succeed");
-        assert_eq!(block.cid.codec(), FOLDER_MANIFEST_CODEC);
+        let block = dir.to_block().expect("to_block should succeed");
+        assert_eq!(block.cid.codec(), DIRECTORY_CODEC);
 
-        let decoded = FolderManifest::from_block(&block).expect("from_block should succeed");
+        let decoded = DirectoryManifest::from_block(&block).expect("from_block should succeed");
         assert_eq!(decoded.entries.len(), 1);
         assert_eq!(decoded.entries[0].name, "test.bin");
     }
 
     #[test]
-    fn test_folder_manifest_find_entry() {
+    fn test_directory_manifest_find_entry() {
         let cid1 = create_test_cid(b"file1", MANIFEST_CODEC);
         let cid2 = create_test_cid(b"file2", MANIFEST_CODEC);
 
-        let folder = FolderManifest::new(vec![
-            FolderEntry {
-                name: "hello.txt".to_string(),
-                manifest_cid: cid1,
-                size: 100,
-                mimetype: "text/plain".to_string(),
-            },
-            FolderEntry {
-                name: "world.bin".to_string(),
-                manifest_cid: cid2,
-                size: 200,
-                mimetype: "application/octet-stream".to_string(),
-            },
-        ]);
+        let dir = DirectoryManifest::new(
+            vec![
+                DirectoryEntry {
+                    name: "hello.txt".to_string(),
+                    cid: cid1,
+                    size: 100,
+                    is_directory: false,
+                    mimetype: "text/plain".to_string(),
+                },
+                DirectoryEntry {
+                    name: "subdir".to_string(),
+                    cid: cid2,
+                    size: 200,
+                    is_directory: true,
+                    mimetype: "".to_string(),
+                },
+            ],
+            "".to_string(),
+        );
 
-        assert!(folder.find_entry("hello.txt").is_some());
-        assert!(folder.find_entry("world.bin").is_some());
-        assert!(folder.find_entry("missing.txt").is_none());
+        assert!(dir.find_entry("hello.txt").is_some());
+        assert!(dir.find_entry("subdir").is_some());
+        assert!(dir.find_entry("missing.txt").is_none());
+        assert!(!dir.find_entry("hello.txt").unwrap().is_directory);
+        assert!(dir.find_entry("subdir").unwrap().is_directory);
     }
 
     #[test]
-    fn test_folder_manifest_wrong_codec() {
+    fn test_directory_manifest_sorted_entries() {
+        let cid1 = create_test_cid(b"file1", MANIFEST_CODEC);
+        let cid2 = create_test_cid(b"dir1", DIRECTORY_CODEC);
+        let cid3 = create_test_cid(b"file2", MANIFEST_CODEC);
+
+        let dir = DirectoryManifest::new(
+            vec![
+                DirectoryEntry { name: "zebra.txt".to_string(), cid: cid1, size: 10, is_directory: false, mimetype: "".to_string() },
+                DirectoryEntry { name: "alpha_dir".to_string(), cid: cid2, size: 20, is_directory: true, mimetype: "".to_string() },
+                DirectoryEntry { name: "apple.txt".to_string(), cid: cid3, size: 30, is_directory: false, mimetype: "".to_string() },
+            ],
+            "".to_string(),
+        );
+
+        let sorted = dir.sorted_entries();
+        assert_eq!(sorted[0].name, "alpha_dir"); // dir first
+        assert_eq!(sorted[1].name, "apple.txt"); // then files alphabetically
+        assert_eq!(sorted[2].name, "zebra.txt");
+    }
+
+    #[test]
+    fn test_directory_manifest_wrong_codec() {
         let cid = create_test_cid(b"test", BLOCK_CODEC);
         let block = Block {
             cid,
             data: vec![1, 2, 3],
         };
-
-        let result = FolderManifest::from_block(&block);
-        assert!(result.is_err());
+        assert!(DirectoryManifest::from_block(&block).is_err());
     }
 
     #[test]
-    fn test_folder_manifest_deterministic_cid() {
+    fn test_directory_manifest_deterministic_cid() {
         let cid1 = create_test_cid(b"file1", MANIFEST_CODEC);
-        let folder = FolderManifest::new(vec![FolderEntry {
-            name: "test.bin".to_string(),
-            manifest_cid: cid1,
-            size: 1024,
-            mimetype: "".to_string(),
-        }]);
+        let dir = DirectoryManifest::new(
+            vec![DirectoryEntry {
+                name: "test.bin".to_string(),
+                cid: cid1,
+                size: 1024,
+                is_directory: false,
+                mimetype: "".to_string(),
+            }],
+            "".to_string(),
+        );
 
-        let block1 = folder.to_block().unwrap();
-        let block2 = folder.to_block().unwrap();
+        let block1 = dir.to_block().unwrap();
+        let block2 = dir.to_block().unwrap();
         assert_eq!(block1.cid, block2.cid);
+    }
+
+    #[test]
+    fn test_is_directory() {
+        let dir_cid = create_test_cid(b"dir", DIRECTORY_CODEC);
+        let file_cid = create_test_cid(b"file", MANIFEST_CODEC);
+        assert!(is_directory(&dir_cid));
+        assert!(!is_directory(&file_cid));
     }
 }
