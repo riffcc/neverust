@@ -1924,8 +1924,19 @@ async fn archivist_stats(State(state): State<ApiState>) -> impl IntoResponse {
 /// SPR endpoint (GET /api/archivist/v1/spr)
 /// Returns the Signed Peer Record for this node
 async fn spr_endpoint(State(state): State<ApiState>) -> Result<String, ApiError> {
-    use crate::spr::generate_spr;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    if let Some(discovery) = &state.discovery {
+        let spr_bytes = discovery.local_spr_bytes();
+        if !spr_bytes.is_empty() {
+            let spr = format!("spr:{}", URL_SAFE_NO_PAD.encode(spr_bytes));
+            info!("Returned discovery-backed SPR for peer {}", state.peer_id);
+            return Ok(spr);
+        }
+    }
+
+    use crate::spr::generate_spr;
 
     // Use current timestamp as sequence number
     let seq = SystemTime::now()
@@ -1962,7 +1973,10 @@ async fn spr_endpoint(State(state): State<ApiState>) -> Result<String, ApiError>
     let spr = generate_spr(&state.keypair, &udp_addrs, seq)
         .map_err(|e| ApiError::Internal(format!("Failed to generate SPR: {}", e)))?;
 
-    info!("Generated SPR for peer {}", state.peer_id);
+    info!(
+        "Generated fallback libp2p SPR for peer {} (discovery-backed SPR unavailable)",
+        state.peer_id
+    );
 
     Ok(spr)
 }

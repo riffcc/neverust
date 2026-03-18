@@ -95,9 +95,13 @@ impl Discovery {
         let enr = builder
             .build(&enr_key)
             .map_err(|e| DiscoveryError::EnrError(e.to_string()))?;
+        let mut enr = enr;
+        enr.use_archivist_node_id()
+            .map_err(|e| DiscoveryError::EnrError(e.to_string()))?;
 
         info!("Local ENR: {}", enr.to_base64());
         info!("Local Peer ID: {}", peer_id);
+        info!("Local DiscV5 NodeId: {}", enr.node_id());
 
         let listen_config = ListenConfig::Ipv4 {
             ip: match listen_addr.ip() {
@@ -173,6 +177,11 @@ impl Discovery {
     /// Get local ENR
     pub fn local_enr(&self) -> enr::Enr<enr::CombinedKey> {
         self.discv5.local_enr()
+    }
+
+    /// Returns the local discovery SPR bytes, if discovery is running.
+    pub fn local_spr_bytes(&self) -> Vec<u8> {
+        self.discv5.local_spr_bytes()
     }
 
     /// Announce that we provide a specific CID to the DHT.
@@ -471,6 +480,7 @@ async fn bootstrap_from_spr(
             .map_err(|e| format!("Failed to build ENR from SPR: {:?}", e))?;
 
     let node_id = bootstrap_enr.node_id();
+    let bootstrap_enr_for_ping = bootstrap_enr.clone();
 
     info!(
         "Bootstrapping DiscV5 from SPR: {} at {} (NodeId: {})",
@@ -484,41 +494,23 @@ async fn bootstrap_from_spr(
         Err(e) => warn!("Failed to add SPR bootstrap to routing table: {}", e),
     }
 
-    // Find nodes close to ourselves — this populates our routing table
-    // with the bootstrap node's neighbors.
+    // Canonical Archivist bootstrap relies on normal protocol requests after the
+    // bootstrap records are installed. Our earlier eager `find_node` burst here
+    // created overlapping handshakes against the same peers and destabilized the
+    // session state machine. Use a single ping instead to warm up the session.
     let discv5_clone = discv5.clone();
-    let our_node_id = discv5.local_enr().node_id();
     tokio::spawn(async move {
-        // First find our own neighborhood (distance 0-256 from us)
-        match discv5_clone.find_node(our_node_id).await {
-            Ok(nodes) => {
+        match discv5_clone.send_ping(bootstrap_enr_for_ping).await {
+            Ok(pong) => {
                 info!(
-                    "DHT bootstrap: discovered {} peers in our neighborhood from {}",
-                    nodes.len(),
-                    socket_addr
+                    "DHT bootstrap: pinged bootstrap {} at {} (observed {}:{})",
+                    node_id, socket_addr, pong.ip, pong.port
                 );
             }
             Err(e) => {
                 debug!(
-                    "DHT bootstrap find_node (self) to {} failed: {}",
-                    socket_addr, e
-                );
-            }
-        }
-        // Then find nodes close to the bootstrap node to populate more of the table
-        match discv5_clone.find_node(node_id).await {
-            Ok(nodes) => {
-                info!(
-                    "DHT bootstrap: discovered {} peers near bootstrap {} from {}",
-                    nodes.len(),
-                    node_id,
-                    socket_addr
-                );
-            }
-            Err(e) => {
-                debug!(
-                    "DHT bootstrap find_node (target) to {} failed: {}",
-                    socket_addr, e
+                    "DHT bootstrap ping to {} ({}) failed: {}",
+                    node_id, socket_addr, e
                 );
             }
         }
